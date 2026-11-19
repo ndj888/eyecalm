@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EyeCalm 静眸 · AI 护眼
 // @namespace    https://github.com/eyecalm/userscript
-// @version      0.4.3
+// @version      0.4.4
 // @description  按网站原有明暗切换纸张配色，可用 AI 在后台适配复杂页面。
 // @homepageURL  https://github.com/ndj888/eyecalm
 // @supportURL   https://github.com/ndj888/eyecalm/issues
@@ -3807,7 +3807,8 @@ function start() {
     stopCachedContrast();
     const hasColor = record => record && Core.parseColor(record.bg)?.a > 0.1;
     const bodyRecord = w.view.find(record => record.el === document.body);
-    w.paintCanvas = !hasColor(bodyRecord) && !bodyRecord?.kept && !w.canvasElement;
+    // A large container can stand in for the canvas, yet the margins around it still show the browser canvas.
+    w.paintCanvas = !hasColor(bodyRecord) && !bodyRecord?.kept;
     const stage = kind === 'ai' && !paintedMode;
     const enableStyles = () => {
       paint(mode, w.mapping.health ?? null);
