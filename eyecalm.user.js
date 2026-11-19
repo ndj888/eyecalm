@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EyeCalm 静眸 · AI 护眼
 // @namespace    https://github.com/eyecalm/userscript
-// @version      0.4.2
+// @version      0.4.3
 // @description  按网站原有明暗切换纸张配色，可用 AI 在后台适配复杂页面。
 // @homepageURL  https://github.com/ndj888/eyecalm
 // @supportURL   https://github.com/ndj888/eyecalm/issues
@@ -1584,6 +1584,70 @@
     };
   }
 
+  function liveDOMSize(document) {
+    return document.getElementsByTagName('*').length;
+  }
+
+  function mutationBuffer(limit) {
+    let records = [], size = 0, rescan = false;
+    return {
+      get pending() { return rescan || records.length > 0; },
+      add(batch, accept) {
+        let accepted = false;
+        for (const record of batch) {
+          if (rescan) break;
+          const weight = record.type === 'childList' ? Math.max(1, record.addedNodes.length + record.removedNodes.length) : 1;
+          if (!accept(record)) continue;
+          accepted = true;
+          size += weight;
+          if (size > limit) {
+            records = [];
+            rescan = true;
+          } else records.push(record);
+        }
+        return accepted;
+      },
+      take() {
+        const batch = { records, rescan };
+        records = [];
+        size = 0;
+        rescan = false;
+        return batch;
+      },
+    };
+  }
+
+  function watchHistory(history, onChange) {
+    const undo = [];
+    let active = true;
+    for (const name of ['pushState', 'replaceState']) {
+      try {
+        const original = history[name];
+        const descriptor = Object.getOwnPropertyDescriptor(history, name);
+        const wrapped = function (...args) {
+          const result = Reflect.apply(original, this, args);
+          if (active) {
+            try { onChange(); } catch { /* Do not change the page's History behavior. */ }
+          }
+          return result;
+        };
+        if (typeof original !== 'function') continue;
+        history[name] = wrapped;
+        undo.push(() => {
+          if (history[name] !== wrapped) return;
+          if (descriptor) Object.defineProperty(history, name, descriptor);
+          else delete history[name];
+        });
+      } catch { /* History can be read-only in some page contexts. */ }
+    }
+    return () => {
+      active = false;
+      for (const restore of undo) {
+        try { restore(); } catch { /* Leave later page changes intact. */ }
+      }
+    };
+  }
+
   const Core = {
     PALETTES, parseColor, normalizeColor, hsl, luminance, contrast, classifyColor, resolveColorRole, complexity, shouldUseAI,
     paletteForDepth, textContrastTarget, visibleContrast, repairContrast, validateContrastFixes,
@@ -1594,6 +1658,7 @@
     normalizeFontScale, normalizeSitePreferences, resolveTextDepth, normalizeRestInterval, adjustFontScale,
     localDay, shouldSuggestScale, restState, reduceRest, restPromptDecision, restSyncEffect, fontScaleSource,
     detectTheme, maskBackground, accentBackground, migrateSettings, activeHostLock, claimHostLease,
+    liveDOMSize, mutationBuffer, watchHistory,
   };
 
 const Panel = {
@@ -2342,6 +2407,7 @@ function start() {
   const mediaTags = new Set(['img', 'video', 'audio', 'canvas', 'svg', 'math', 'iframe', 'picture', 'object', 'embed']);
   const ignoredTags = new Set(['head', 'style', 'script', 'template', 'link', 'meta', 'noscript']);
   const maxNodes = 30000;
+  const maxPendingChanges = 2048;
   const maxView = 420;
   const cacheLimit = 3 * 1024 * 1024;
   const encoder = new TextEncoder();
@@ -3401,7 +3467,7 @@ function start() {
       const declarations = el.style;
       for (let i = 0; i < declarations.length; i++) {
         const name = declarations[i];
-        if (!validVariableName(name)) continue;
+        if (!validVariableName(name) || (w.mappedVariables && !w.mappedVariables.has(name))) continue;
         const value = normalize(safe(() => style.getPropertyValue(name), ''));
         if (value) rememberVariable(w.variables, name, selector, value, scope);
       }
@@ -3535,6 +3601,29 @@ function start() {
     }
   }
 
+  function* viewportElements(w) {
+    const seen = new WeakSet();
+    const width = innerWidth, height = innerHeight;
+    if (!width || !height) return;
+    for (let row = 0; row < 8; row++) for (let col = 0; col < 8; col++) {
+      const x = width * (col + 0.5) / 8, y = height * (row + 0.5) / 8;
+      const scopes = new Set([document]);
+      for (const scope of scopes) {
+        for (const hit of scope.elementsFromPoint?.(x, y) || []) {
+          for (let el = hit; el && !seen.has(el); el = composedParent(el)) {
+            seen.add(el);
+            if (!followable(el)) continue;
+            const shadow = safe(() => el.shadowRoot, null);
+            if (shadow) watchShadow(w, shadow);
+            yield el;
+          }
+          const shadow = safe(() => hit.shadowRoot, null);
+          if (shadow && followable(hit)) scopes.add(shadow);
+        }
+      }
+    }
+  }
+
   function analyze(w) {
     const backgrounds = new Set();
     const colors = new Map();
@@ -3621,6 +3710,7 @@ function start() {
   }
 
   function updateVotes(w, el, selector, paletteRoles) {
+    if (!w.votes) return;
     const prior = w.votes.get(el);
     if (prior) {
       const vote = w.groups.get(prior.key);
@@ -3711,6 +3801,8 @@ function start() {
       fallback: result.fallback ?? true, health: currentHealth(),
       colors: new Map((result.colorRoles || []).map(({ prop, color, role }) => [`${prop}|${normalize(color)}`, role])),
     };
+    w.mappedVariables = new Set(w.mapping.varRoles.map(({ name }) => name));
+    for (const name of w.variables.keys()) if (!w.mappedVariables.has(name)) w.variables.delete(name);
     w.mapping.locallySufficient = !(w.mapping.varRoles.length || w.mapping.colorRoles.length || w.mapping.css);
     stopCachedContrast();
     const hasColor = record => record && Core.parseColor(record.bg)?.a > 0.1;
@@ -3757,16 +3849,17 @@ function start() {
   function observe(w, scope) {
     const observer = new MutationObserver(raw => {
       if (!live(w)) return;
-      if (w.mutationCount >= maxNodes) return;
-      const records = raw.filter(record => {
+      const accepted = w.mutations.add(raw, record => {
         const target = record.target.nodeType === 1 ? record.target : record.target.parentElement;
-        return (!target || !own(target)) && (record.type !== 'childList' ||
-          [...record.addedNodes, ...record.removedNodes].some(node => node.nodeType === 1 ? !own(node) : node.nodeType === 3));
+        if (target && own(target)) return false;
+        if (record.type !== 'childList') return true;
+        for (const nodes of [record.addedNodes, record.removedNodes]) {
+          for (const node of nodes) if (node.nodeType === 1 ? !own(node) : node.nodeType === 3) return true;
+        }
+        return false;
       });
-      if (!records.length) return;
-      w.mutations.push(records);
-      w.mutationCount += records.length;
-      scheduleChanges(w);
+      if (accepted && performance.now() < w.routeUntil) queueViewport(w);
+      if (w.mutations.pending) scheduleChanges(w);
     });
     observer.observe(scope, { childList: true, subtree: true, attributes: true, characterData: true,
       attributeFilter: contrastAttributes });
@@ -3778,7 +3871,7 @@ function start() {
     if (discovered) observe(w, scope);
     if (w.mapping) installShadow(scope);
     if (discovered && w.finished) {
-      if (w.queued.size < maxNodes) w.queued.add(scope.host);
+      queueRoot(w, scope.host, true);
       if (w.mapping.css) {
         const sheets = shadows.get(scope);
         sheets.overrides = replaceStyle(scope, sheets.overrides, 'shadow-overrides', guardedCSS(w.mapping.css));
@@ -3787,11 +3880,13 @@ function start() {
   }
 
   function probeShadows(w) {
-    let iterator;
+    let iterator, large;
     function probe() {
-      if (!live(w) || w.count >= maxNodes) return;
+      if (!live(w)) return;
       if (!document.hidden) {
-        iterator ||= elements(root, w);
+        const oversized = Core.liveDOMSize(document) > maxNodes;
+        if (oversized !== large) { large = oversized; iterator = null; }
+        iterator ||= large ? viewportElements(w) : elements(root, w);
         const end = performance.now() + 2;
         for (let count = 0; count < 500 && performance.now() < end; count++) {
           if (iterator.next().done) { iterator = null; break; }
@@ -3801,11 +3896,48 @@ function start() {
       w.probe = setTimeout(schedule, iterator ? 750 : 2500);
     }
     function schedule() {
-      if (!live(w) || w.count >= maxNodes) return;
+      if (!live(w)) return;
       if (typeof requestIdleCallback === 'function') w.probeIdle = requestIdleCallback(probe, { timeout: 1000 });
       else probe();
     }
     w.probe = setTimeout(schedule, 1200);
+  }
+
+  function queueRoot(w, el, added = false) {
+    if (w.rescan) return;
+    if (!w.queued.has(el) && w.queued.size >= maxPendingChanges) {
+      w.queued.clear();
+      w.rescan = true;
+    } else w.queued.set(el, added || w.queued.get(el));
+  }
+
+  function queueViewport(w) {
+    w.viewportPending = true;
+    paintViewport(w);
+  }
+
+  async function paintViewport(w) {
+    if (!w.finished || w.viewportRunning || !w.viewportPending || !live(w)) return;
+    w.viewportRunning = true;
+    w.viewportPending = false;
+    const cursor = viewportElements(w), changes = [];
+    try {
+      // A route can change while an earlier subtree or its contrast is still being processed.
+      await slices(w, () => {
+        const next = cursor.next();
+        if (next.done) return true;
+        const record = sample(next.value, w, false);
+        if (record) changes.push(record);
+        return false;
+      }, end => flushRecords(changes, end, record => applyRecord(w, record)), task => sampleOriginal(w, task));
+    } catch { /* Mutation processing remains available if viewport sampling fails. */ }
+    finally {
+      w.viewportRunning = false;
+      if (live(w)) {
+        paintViewport(w);
+        scheduleChanges(w);
+      }
+    }
   }
 
   function scheduleChanges(w) {
@@ -3818,35 +3950,31 @@ function start() {
     });
   }
 
-  function* mutationRoots(batches, pending) {
-    for (const el of pending) yield { el, remove: false };
-    for (const records of batches) {
-      for (const record of records) {
-        const target = record.target;
-        if (target.nodeType === 1 && own(target)) { yield null; continue; }
-        if (record.type === 'attributes') {
-          yield { el: target, remove: !followable(target) };
-          continue;
-        }
-        if (record.type === 'characterData') {
-          const parent = target.parentElement;
-          if (parent && !own(parent)) yield { el: parent.localName === 'style' ? root : parent, remove: false };
-          continue;
-        }
-        if (target.nodeType === 1 && target.localName === 'style') {
-          yield { el: target.getRootNode().host || root, remove: false };
-          continue;
-        }
-        if ([...record.addedNodes, ...record.removedNodes].some(node =>
-          (node.nodeType === 1 && ['style', 'link'].includes(node.localName) && !own(node)))) {
-          yield { el: target.getRootNode().host || root, remove: false };
-        }
-        if (target.nodeType === 1 && [...record.addedNodes, ...record.removedNodes].some(node => node.nodeType === 3)) {
-          yield { el: target, remove: false };
-        }
-        for (const el of record.addedNodes) yield { el, remove: false };
-        for (const el of record.removedNodes) yield { el, remove: true };
+  function* mutationRoots(records, pending) {
+    for (const [el, added] of pending) yield { el, remove: false, added };
+    for (const record of records) {
+      const target = record.target;
+      if (target.nodeType === 1 && own(target)) { yield null; continue; }
+      if (record.type === 'attributes') {
+        yield { el: target, remove: !followable(target) };
+        continue;
       }
+      if (record.type === 'characterData') {
+        const parent = target.parentElement;
+        if (parent && !own(parent)) yield { el: parent.localName === 'style' ? parent.getRootNode().host || root : parent, remove: false };
+        continue;
+      }
+      if (target.nodeType === 1 && target.localName === 'style') {
+        yield { el: target.getRootNode().host || root, remove: false };
+        continue;
+      }
+      const nodes = [...record.addedNodes, ...record.removedNodes];
+      if (nodes.some(node => node.nodeType === 1 && ['style', 'link'].includes(node.localName) && !own(node))) {
+        yield { el: target.getRootNode().host || root, remove: false };
+      }
+      if (target.nodeType === 1 && nodes.some(node => node.nodeType === 3)) yield { el: target, remove: false };
+      for (const el of record.addedNodes) yield { el, remove: false, added: true };
+      for (const el of record.removedNodes) yield { el, remove: true };
     }
   }
 
@@ -3864,22 +3992,64 @@ function start() {
     deleteStyle(sheets?.base);
     deleteStyle(sheets?.overrides);
     shadows.delete(scope);
+    for (const [name, definitions] of w.variables) {
+      const remaining = definitions.filter(def => def.scope !== scope);
+      if (remaining.length) w.variables.set(name, remaining);
+      else w.variables.delete(name);
+    }
+  }
+
+  function* trackedElements(w) {
+    yield* marked;
+    yield* masks;
+    yield* w.contrastCandidates;
+    yield* contrastRows.keys();
+    for (const scope of w.observers.keys()) if (scope.host) yield scope.host;
+  }
+
+  function nearViewport(el) {
+    const rect = el.getBoundingClientRect();
+    const margin = innerHeight / 4;
+    return rect.width > 0 && rect.height > 0 && rect.right > 0 && rect.left < innerWidth &&
+      rect.bottom > -margin && rect.top < innerHeight + margin;
   }
 
   async function drainChanges(w) {
-    if (!w.finished || w.drain || !live(w) || !w.mapping || (!w.queued.size && !w.mutations.length)) return;
+    if (!w.finished || w.drain || !live(w) || !w.mapping ||
+        !(w.queued.size || w.rescan || w.mutations.pending || w.contrastDirty.size)) return;
     w.drain = true;
     root.setAttribute('data-ec-updating', '');
     const touched = new WeakSet();
     const removed = new WeakSet();
-    const roots = mutationRoots(w.mutations, w.queued);
-    w.mutations = [];
-    w.mutationCount = 0;
-    w.queued = new Set();
-    let cursor, pruning;
+    const batch = w.mutations.take(), pending = w.queued;
+    let large = Core.liveDOMSize(document) > maxNodes;
+    const overflow = batch.rescan || w.rescan;
+    const rescan = overflow || (w.large && !large);
+    w.large = large;
+    w.queued = new Map();
+    w.rescan = false;
+    const roots = mutationRoots(batch.records, rescan && !large ? new Map([[root, false]]) : pending);
+    // A coalesced rescan cannot enumerate detached subtrees from the discarded records.
+    let sweep = overflow ? trackedElements(w) : null;
+    let cursor, cursorRoot, pruning, added, requestedViewport = false;
+    const prioritizeViewport = () => {
+      if (!requestedViewport) { requestedViewport = true; queueViewport(w); }
+    };
+    if (rescan) prioritizeViewport();
+    const forget = el => {
+      if (!removed.has(el) && (!el.isConnected || !followable(el))) {
+        removed.add(el);
+        forgetElement(w, el);
+      }
+    };
     const changes = [];
     await slices(w, () => {
-      if (w.count >= maxNodes) return true;
+      if (sweep) {
+        const next = sweep.next();
+        if (!next.done) { forget(next.value); return false; }
+        sweep = null;
+      }
+      if (cursor && !pruning && !cursorRoot.isConnected) cursor = null;
       if (!cursor) {
         const next = roots.next();
         if (next.done) return true;
@@ -3888,40 +4058,39 @@ function start() {
         pruning = task.remove || !followable(task.el);
         if (pruning && task.el.isConnected && followable(task.el)) return false;
         if (!pruning && !task.el.isConnected) return false;
-        cursor = elements(task.el, w, pruning);
+        cursorRoot = task.el;
+        added = task.added;
+        if (large && !pruning && !added) {
+          prioritizeViewport();
+          if (!nearViewport(task.el)) return false;
+          cursor = [task.el][Symbol.iterator]();
+        } else cursor = elements(task.el, w, pruning);
       }
       const item = cursor.next();
       if (item.done) { cursor = null; return false; }
       const el = item.value;
       if (pruning) {
-        if (!removed.has(el) && (!el.isConnected || !followable(el))) {
-          removed.add(el);
-          forgetElement(w, el);
-        }
+        forget(el);
         return false;
       }
       if (!touched.has(el)) {
         touched.add(el);
-        const newlySampled = !w.sampled.has(el);
-        if (newlySampled) {
-          w.sampled.add(el);
-          w.count++;
-        }
         const record = sample(el, w, false);
         if (record) changes.push(record);
       }
       return false;
-    }, end => flushRecords(changes, end, record => applyRecord(w, record)), task => sampleOriginal(w, task));
+    }, end => flushRecords(changes, end, record => applyRecord(w, record)), task => {
+      if (!large && Core.liveDOMSize(document) > maxNodes) {
+        large = w.large = true;
+        if (!pruning && !added) cursor = null;
+        prioritizeViewport();
+      }
+      return sampleOriginal(w, task);
+    });
     let overridesChanged = false;
     if (live(w) && w.mapping.varRoles.length) {
       await discoverDefinitions(w);
       if (live(w)) overridesChanged = updateOverrides(w);
-    }
-    let compiledCss;
-    if (live(w) && w.count >= maxNodes) {
-      compiledCss = fastCSS(w);
-      cacheStyle = replaceStyle(root, cacheStyle, 'cached', guardedCSS(compiledCss));
-      stopSampling(w);
     }
     if (live(w)) {
       const dirty = w.contrastDirty;
@@ -3929,11 +4098,11 @@ function start() {
       if (dirty.size || overridesChanged) {
         await measureContrast(w, overridesChanged ? new Set([...w.contrastCandidates, ...dirty]) : dirty);
       }
-      if (live(w)) persistContrast(w, compiledCss);
+      if (live(w)) persistContrast(w);
     }
     w.drain = false;
     if (!live(w)) return;
-    if (w.queued.size || w.mutations.length) scheduleChanges(w);
+    if (w.queued.size || w.rescan || w.mutations.pending || w.contrastDirty.size) scheduleChanges(w);
     else root.removeAttribute('data-ec-updating');
   }
 
@@ -3944,6 +4113,7 @@ function start() {
     root?.removeAttribute('data-ec-updating');
     clearTimeout(run.retry);
     clearTimeout(run.probe);
+    clearTimeout(run.viewportTimer);
     if (run.probeIdle != null) safe(() => cancelIdleCallback(run.probeIdle));
     for (const observer of run.observers.values()) observer.disconnect();
     run = null;
@@ -4102,32 +4272,37 @@ function start() {
     setCurrentHealth(health, overrides);
     await applyProfile(w, result, kind, mode, !!entry);
     if (!live(w)) return;
+    w.view = [];
+    w.large = Core.liveDOMSize(document) > maxNodes;
+    let remaining = w.large ? viewportElements(w) : iterator;
     const samples = [];
     await slices(w, () => {
-      if (w.count >= maxNodes) return true;
-      const next = iterator.next();
+      const next = remaining.next();
       if (next.done) return true;
       const el = next.value;
       if (w.sampled.has(el)) return false;
       w.sampled.add(el);
-      w.count++;
       const record = sample(el, w, false);
       if (record) samples.push(record);
       return false;
-    }, end => flushRecords(samples, end, record => applyRecord(w, record)), task => sampleOriginal(w, task));
+    }, end => flushRecords(samples, end, record => applyRecord(w, record)), task => {
+      if (!w.large && Core.liveDOMSize(document) > maxNodes) {
+        w.large = true;
+        remaining = viewportElements(w);
+      }
+      return sampleOriginal(w, task);
+    });
     if (!live(w)) return;
     if (w.mapping.varRoles.length) await discoverDefinitions(w);
     if (!live(w) || !currentGeneration(w) || !themeStillCurrent(w)) return;
     updateOverrides(w);
     const compiledCss = fastCSS(w);
-    if (w.count >= maxNodes) {
-      cacheStyle = replaceStyle(root, cacheStyle, 'cached', guardedCSS(compiledCss));
-      stopSampling(w);
-    } else {
-      deleteStyle(cacheStyle);
-      cacheStyle = null;
-      probeShadows(w);
-    }
+    // Selector votes are only needed for the startup cache, not for the lifetime of the SPA.
+    w.votes = w.sampled = null;
+    w.groups.clear();
+    deleteStyle(cacheStyle);
+    cacheStyle = null;
+    probeShadows(w);
     await measureContrast(w, w.contrastCandidates);
     if (!live(w) || !currentGeneration(w) || !themeStillCurrent(w)) return;
     w.contrastDirty.clear();
@@ -4153,6 +4328,7 @@ function start() {
       putProfile(saved, w);
     }
     setStatus(entry ? 'cached' : kind);
+    paintViewport(w);
     scheduleChanges(w);
   }
 
@@ -4175,28 +4351,40 @@ function start() {
     observe(w, document);
     const cssStateChange = event => {
       const el = event.composedPath()[0];
-      if (el?.nodeType !== 1 || !live(w) || w.count >= maxNodes || own(el)) return;
+      if (el?.nodeType !== 1 || !live(w) || own(el)) return;
       if (event.type === 'load' && el.localName !== 'link') return;
       if (event.type === 'transitionend' && !/^(?:background(?:-color)?|color|opacity|-webkit-text-fill-color|filter|backdrop-filter)$/.test(event.propertyName)) return;
       if (event.type !== 'load' && event.type !== 'transitionend' && !['input', 'textarea', 'select', 'button'].includes(el.localName)) return;
-      if (w.queued.size < maxNodes) w.queued.add(event.type === 'load' ? root : el);
+      queueRoot(w, event.type === 'load' ? root : el);
       scheduleChanges(w);
     };
     for (const type of ['load', 'input', 'change', 'focusin', 'focusout', 'transitionend']) {
       document.addEventListener(type, cssStateChange, { capture: true, signal: w.controller.signal });
     }
-    w.domSize = document.getElementsByTagName('*').length;
+    const viewportMoved = () => {
+      if (!w.large || !live(w) || w.viewportTimer != null) return;
+      w.viewportTimer = setTimeout(() => {
+        w.viewportTimer = null;
+        if (live(w)) queueViewport(w);
+      }, 100);
+    };
+    const viewportOptions = { capture: true, passive: true, signal: w.controller.signal };
+    window.addEventListener('scroll', viewportMoved, viewportOptions);
+    window.addEventListener('resize', viewportMoved, viewportOptions);
+    w.domSize = Core.liveDOMSize(document);
     originalFacts(w);
     w.viewportBounds = { left: 0, top: 0, right: Math.max(1, innerWidth), bottom: Math.max(1, innerHeight) };
     w.typographyRange = document.createRange();
     w.typographyContexts = new WeakMap();
     const cursor = elements(root, w);
-    const viewport = viewportCandidates(w);
-    let viewportDone = false;
+    const limited = w.domSize > maxNodes;
+    const viewport = limited ? viewportElements(w) : viewportCandidates(w);
+    let viewportDone = false, count = 0;
     await slices(w, () => {
-      if (w.count >= maxView) return true;
+      if (count >= maxView) return true;
       let next = viewportDone ? cursor.next() : viewport.next();
       if (!viewportDone && next.done) {
+        if (limited) return true;
         viewportDone = true;
         next = cursor.next();
       }
@@ -4206,13 +4394,14 @@ function start() {
       const shadow = safe(() => el.shadowRoot, null);
       if (shadow) watchShadow(w, shadow);
       w.sampled.add(el);
-      w.count++;
+      count++;
       const record = sample(el, w, true);
       if (record) w.view.push(record);
       return false;
     }, null, task => measureWithoutZoom(() => sampleOriginal(w, task)));
     if (!live(w)) return;
     const analysis = analyze(w);
+    w.theme = null;
     w.typographyRange = w.typographyContexts = null;
     w.localHealth = Core.localHealth(analysis.typography);
     w.automaticAI = Core.shouldUseAI({ policy: settings.aiPolicy, hasKey: !!apiKey,
@@ -4306,13 +4495,6 @@ function start() {
     }
   }
 
-  function stopSampling(w) {
-    for (const observer of w.observers.values()) observer.disconnect();
-    w.queued.clear();
-    w.mutations.length = 0;
-    w.mutationCount = 0;
-  }
-
   function selectMeasuredMode(theme) {
     if (selectedMode !== theme.mode || (paintedMode && paintedMode !== theme.mode)) {
       clearPaint();
@@ -4377,9 +4559,9 @@ function start() {
       }
     };
     const w = {
-      force, manual, controller: new AbortController(), observers: new Map(), queued: new Set(), variables: new Map(),
-      groups: new Map(), votes: new WeakMap(), sampled: new WeakSet(), view: [], count: 0, finished: false,
-      mutations: [], mutationCount: 0, contrastCandidates: new Set(), contrastDirty: new Set(),
+      force, manual, controller: new AbortController(), observers: new Map(), queued: new Map(), variables: new Map(),
+      groups: new Map(), votes: new WeakMap(), sampled: new WeakSet(), view: [], finished: false,
+      mutations: Core.mutationBuffer(maxPendingChanges), contrastCandidates: new Set(), contrastDirty: new Set(),
       cacheGeneration: read(clearKey, null), hostGeneration: read(hostClearKey, null),
     };
     run = w;
@@ -4400,7 +4582,7 @@ function start() {
       } catch {
         if (!live(w)) return;
         lastError = '读取网页配色时遇到错误。';
-        stopSampling(w);
+        cancelRun('inspection-failed');
         setStatus(paintedMode ? status : 'off');
       }
     };
@@ -4571,6 +4753,17 @@ function start() {
     restart();
   }
 
+  function onRouteChange() {
+    if (!run || !live(run)) return;
+    run.routeUntil = performance.now() + 1000;
+    queueViewport(run);
+  }
+
+  const pageHistory = safe(() => (typeof unsafeWindow === 'undefined' ? window : unsafeWindow).history, window.history);
+  const unwatchHistory = Core.watchHistory(pageHistory, onRouteChange);
+  // In an isolated userscript world, History wrappers may not see page-script calls.
+  window.navigation?.addEventListener('currententrychange', onRouteChange);
+  window.addEventListener('popstate', onRouteChange);
   darkPreference?.addEventListener('change', scheduleThemeCheck);
   window.addEventListener('pagehide', suspendPage);
   window.addEventListener('beforeunload', suspendPage);
@@ -4686,6 +4879,9 @@ function start() {
     window.removeEventListener('pagehide', suspendPage);
     window.removeEventListener('beforeunload', suspendPage);
     window.removeEventListener('pageshow', resumePage);
+    window.removeEventListener('popstate', onRouteChange);
+    window.navigation?.removeEventListener('currententrychange', onRouteChange);
+    unwatchHistory();
     for (const unsubscribe of listeners) unsubscribe();
     window.removeEventListener('storage', onStorage);
     clearPaint();
