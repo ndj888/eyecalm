@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EyeCalm 静眸 · AI 护眼
 // @namespace    https://github.com/eyecalm/userscript
-// @version      0.4.1
+// @version      0.4.2
 // @description  按网站原有明暗切换纸张配色，可用 AI 在后台适配复杂页面。
 // @homepageURL  https://github.com/ndj888/eyecalm
 // @supportURL   https://github.com/ndj888/eyecalm/issues
@@ -169,9 +169,9 @@
     }
     const confidence = light + dark ? Math.abs(light - dark) / (light + dark) : 0;
     const declared = declarations.find(mode => MODES.includes(mode));
-    if (confidence < 0.2 && declared) return { mode: declared, confidence };
-    const mode = light !== dark ? (light > dark ? 'light' : 'dark') : fallback.map(themeSample).find(Boolean) || 'light';
-    return { mode, confidence };
+    const measured = light !== dark ? (light > dark ? 'light' : 'dark') : fallback.map(themeSample).find(Boolean);
+    const mode = confidence < 0.2 && declared ? declared : measured || 'light';
+    return { mode, confidence, confirmed: !!declared && declared === measured };
   }
 
   function accentBackground(value) {
@@ -2380,7 +2380,8 @@ function start() {
   let root = document.documentElement;
   let zoomStyle, scaleHintTimer, restCleanup;
   let paletteStyle, baseStyle, cacheStyle, overrideStyle, paintedMode;
-  let status = 'off', run, rootObserver, themeObserver, themeTimer, observedBody, stopped = false;
+  let status = 'off', run, rootObserver, themeObserver, observedBody, stopped = false;
+  let themeCheckTimer, themeConfirmTimer, themeCandidate;
   const safe = (operation, fallback) => {
     try { return operation(); } catch { return fallback; }
   };
@@ -3030,14 +3031,23 @@ function start() {
   }
 
   function contrastFor(el, backdrops, canvas, original) {
-    if (original?.accent && !accentButtonText(el, Core.parseColor(original.fillColor))) original = null;
-    const rows = readContrast(el, backdrops, canvas).flatMap(row => {
+    const measured = readContrast(el, backdrops, canvas);
+    original = retainedInk(el, original, measured);
+    const rows = measured.flatMap(row => {
       if (original?.preserve || (original?.accent && row.kind === 'text')) return [];
       const ink = { black: Core.parseColor(row.blackPoint), weight: row.inkWeight };
       const fix = Core.repairContrast(row.source, row.background, row.target, row.opacity, row.kind === 'placeholder', ink);
       return fix ? [{ ...row, color: fix.color, fixOpacity: fix.opacity !== row.opacity }] : [];
     });
     return original ? [original, ...rows] : rows;
+  }
+
+  function retainedInk(el, original, measured) {
+    // A native backdrop can be indeterminate (e.g. translucent blur) but become
+    // measurable once EyeCalm paints it. Preserve ink only while it is still unknown.
+    if (original?.preserve && measured.some(row => row.kind === 'text')) return null;
+    if (original?.accent && !accentButtonText(el, Core.parseColor(original.fillColor))) return null;
+    return original;
   }
 
   function setContrastRows(el, rows) {
@@ -3141,8 +3151,8 @@ function start() {
         }
       });
       withoutStyles(contrastStyles.values(), () => {
-        for (const [el, rows] of updates) {
-          if (rows[0].accent && !accentButtonText(el, Core.parseColor(rows[0].fillColor))) updates.delete(el);
+        for (const [el, [original]] of updates) {
+          if (!retainedInk(el, original, original.preserve ? readContrast(el, backdrops, canvas) : [])) updates.delete(el);
         }
         for (const [selector, candidates] of groups) {
           for (const el of Array.from(document.querySelectorAll(selector)).slice(0, maxView)) {
@@ -4313,20 +4323,43 @@ function start() {
     if (read(lastModeKey, null) !== selectedMode) write(lastModeKey, selectedMode);
   }
 
+  function resetThemeCandidate() {
+    clearTimeout(themeConfirmTimer);
+    themeConfirmTimer = null;
+    themeCandidate = null;
+  }
+
+  function acceptTheme(theme) {
+    if (theme.mode !== selectedMode && !theme.confirmed) {
+      const now = performance.now();
+      if (themeCandidate?.mode !== theme.mode) themeCandidate = { mode: theme.mode, since: now };
+      const remaining = 1000 - (now - themeCandidate.since);
+      if (remaining > 0) {
+        // Measure again even if the temporary startup layer disappears without a root mutation.
+        themeConfirmTimer ??= setTimeout(() => {
+          themeConfirmTimer = null;
+          checkTheme();
+        }, Math.ceil(remaining));
+        return false;
+      }
+    }
+    resetThemeCandidate();
+    return true;
+  }
+
   function themeStillCurrent(w, force = false) {
-    if (!force && themeTimer == null) return true;
+    if (!force && themeCheckTimer == null && !themeCandidate) return true;
     const theme = measureTheme();
-    if (theme.mode === w.mode) return true;
+    if (!acceptTheme(theme) || theme.mode === w.mode) return true;
     restart({ retainPaint: false, theme });
     return false;
   }
 
   function restart({ force = false, manual = false, retainPaint = true, theme } = {}) {
     cancelRun(theme && theme.mode !== run?.mode ? 'theme-changed' : 'superseded');
-    clearTimeout(themeTimer);
-    themeTimer = null;
     if (!root) return;
     if (!enabled()) {
+      resetThemeCandidate();
       setCurrentHealth(null);
       clearPaint();
       setStatus('off');
@@ -4353,7 +4386,12 @@ function start() {
     const ready = async (restoredAtStart = false) => {
       try {
         attachThemeBody();
-        w.theme = theme || measureTheme();
+        const measured = theme || measureTheme();
+        if (!theme && !acceptTheme(measured)) {
+          if (!restoredAtStart) restoreSelected(retainPaint);
+          return;
+        }
+        w.theme = measured;
         w.mode = w.theme.mode;
         const switched = selectedMode !== w.mode;
         selectMeasuredMode(w.theme);
@@ -4465,15 +4503,22 @@ function start() {
     applySettingsChanges(before);
   }
 
+  function checkTheme() {
+    if (stopped || suspended || !enabled() || !root || document.readyState === 'loading') return;
+    const theme = measureTheme();
+    if (!acceptTheme(theme)) return;
+    const switched = theme.mode !== selectedMode;
+    const waiting = run && !run.mode ? run : null;
+    if (switched || waiting) restart({ force: waiting?.force, manual: waiting?.manual, retainPaint: !switched, theme });
+  }
+
   function scheduleThemeCheck() {
-    if (!enabled() || !root || document.readyState === 'loading') return;
-    clearTimeout(themeTimer);
-    themeTimer = setTimeout(() => {
-      themeTimer = null;
-      if (!enabled()) return;
-      const theme = measureTheme();
-      if (theme.mode !== selectedMode) restart({ retainPaint: false, theme });
-    }, 300);
+    if (suspended || !enabled() || !root || document.readyState === 'loading') return;
+    // Coalesce attribute churn without postponing a check behind ongoing mutations.
+    themeCheckTimer ??= setTimeout(() => {
+      themeCheckTimer = null;
+      checkTheme();
+    }, 32);
   }
 
   function attachThemeBody() {
@@ -4511,8 +4556,9 @@ function start() {
   function suspendPage(event) {
     suspended = true;
     clearTimeout(resumeTimer);
-    clearTimeout(themeTimer);
-    themeTimer = null;
+    clearTimeout(themeCheckTimer);
+    themeCheckTimer = null;
+    resetThemeCandidate();
     activeLease?.();
     cancelRun();
     // A site can cancel beforeunload. Resume if no pagehide follows.
@@ -4628,7 +4674,8 @@ function start() {
     if (stopped) return;
     stopped = true;
     clearTimeout(resumeTimer);
-    clearTimeout(themeTimer);
+    clearTimeout(themeCheckTimer);
+    resetThemeCandidate();
     restCleanup?.();
     stopScaleHint();
     zoomStyle?.remove();
