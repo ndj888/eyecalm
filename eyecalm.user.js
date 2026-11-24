@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EyeCalm 静眸 · AI 护眼
 // @namespace    https://github.com/eyecalm/userscript
-// @version      0.4.5
+// @version      0.5.0
 // @description  按网站原有明暗切换纸张配色，可用 AI 在后台适配复杂页面。
 // @homepageURL  https://github.com/ndj888/eyecalm
 // @supportURL   https://github.com/ndj888/eyecalm/issues
@@ -34,6 +34,12 @@
   const DEFAULT_MODEL = 'gpt-6.1-terra';
   const SETTINGS_VERSION = 1;
   const MASK_NAME = /scrim|backdrop|overlay|mask|modal[-_ ]?(?:background|bg)/i;
+  const mediaTags = new Set(['img', 'video', 'audio', 'canvas', 'svg', 'math', 'iframe', 'picture', 'object', 'embed']);
+  const sampleMotionSelector = ':is(*,#ec-sample#ec-sample#ec-sample)';
+  const sampleMotionCSS = `${sampleMotionSelector},${sampleMotionSelector}::placeholder{transition-duration:0s!important;transition-delay:0s!important}`;
+  const safe = (operation, fallback) => {
+    try { return operation(); } catch { return fallback; }
+  };
   const LOCK_HEARTBEAT = 10_000;
   const LOCK_STALE = 25_000;
   const SITE_TYPES = ['reading', 'feed', 'docs', 'app', 'video', 'shop', 'other'];
@@ -61,45 +67,152 @@
     },
   };
 
-  const NUMBER_OR_PERCENT = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)%?$/;
-  function colorChannel(token, maximum) {
-    if (!NUMBER_OR_PERCENT.test(token)) return NaN;
-    const percent = token.endsWith('%');
-    const number = Number(percent ? token.slice(0, -1) : token);
-    const value = percent ? (number / 100) * maximum : number;
-    return value >= 0 && value <= maximum ? value : NaN;
+  const CSS_NUMBER = '[+-]?(?:\\d*\\.\\d+|\\d+)(?:e[+-]?\\d+)?';
+  const COLOR_NUMBER = new RegExp(`^(${CSS_NUMBER})(%)?$`);
+  const COLOR_HUE = new RegExp(`^(${CSS_NUMBER})(deg|grad|rad|turn)?$`);
+  const trimColor = value => value.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '');
+  const clampColor = (value, max = 1) => Math.max(0, Math.min(max, value));
+
+  function colorComponent(token, percentScale, allowNone) {
+    if (allowNone && token === 'none') return 0;
+    const match = COLOR_NUMBER.exec(token);
+    if (!match) return NaN;
+    const value = Number(match[1]);
+    return match[2] ? value / 100 * percentScale : value;
   }
 
-  function parseColor(value) {
-    if (typeof value !== 'string' || value.length > 100) return null;
-    const input = value.trim().toLowerCase();
-    if (input === 'transparent') return { r: 0, g: 0, b: 0, a: 0 };
+  function hueDegrees(token, allowNone) {
+    if (allowNone && token === 'none') return 0;
+    const match = COLOR_HUE.exec(token);
+    if (!match) return NaN;
+    const value = Number(match[1]);
+    const turn = { grad: 400, rad: 2 * Math.PI, turn: 1 }[match[2]] || 360;
+    return (((value % turn) / turn) * 360 + 360) % 360;
+  }
+
+  const XYZ_TO_SRGB = [
+    [3.2409699419, -1.5373831776, -0.4986107603],
+    [-0.9692436363, 1.8759675015, 0.0415550574],
+    [0.0556300797, -0.2039769589, 1.0569715142],
+  ];
+  const D50_TO_D65 = [
+    [0.9554734215, -0.0230984549, 0.0632592432],
+    [-0.0283697093, 1.0099953981, 0.0210414412],
+    [0.0123140149, -0.0205076493, 1.3303659262],
+  ];
+  const P3_TO_XYZ = [
+    [0.4865709486, 0.2656676932, 0.1982172852],
+    [0.2289745641, 0.6917385218, 0.0792869141],
+    [0, 0.0451133819, 1.0439443689],
+  ];
+  const multiplyColor = (matrix, [x, y, z]) => matrix.map(([a, b, c]) => a * x + b * y + c * z);
+  const encodeSRGB = linear => linear <= 0.0031308 ? 12.92 * linear : 1.055 * linear ** (1 / 2.4) - 0.055;
+  const decodeSRGB = value => Math.sign(value) * (Math.abs(value) <= 0.04045 ? Math.abs(value) / 12.92 : ((Math.abs(value) + 0.055) / 1.055) ** 2.4);
+
+  function labToSRGB([l, a, b], ok) {
+    if (ok) {
+      // Oklab uses D65; the combined inverse LMS/XYZ/sRGB transform stays linear until encoding.
+      const x = (l + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+      const y = (l - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+      const z = (l - 0.0894841775 * a - 1.2914855480 * b) ** 3;
+      return [4.0767416621 * x - 3.3077115913 * y + 0.2309699292 * z,
+        -1.2684380046 * x + 2.6097574011 * y - 0.3413193965 * z,
+        -0.0041960863 * x - 0.7034186147 * y + 1.7076147010 * z].map(encodeSRGB);
+    }
+    // CSS CIELAB is D50. Bradford-adapt to D65 before converting XYZ to sRGB.
+    const y = (l + 16) / 116;
+    const inverse = value => value > 6 / 29 ? value ** 3 : (116 * value - 16) / (24389 / 27);
+    const xyz = [0.3457 / 0.3585 * inverse(y + a / 500), inverse(y), (1 - 0.3457 - 0.3585) / 0.3585 * inverse(y - b / 200)];
+    return multiplyColor(XYZ_TO_SRGB, multiplyColor(D50_TO_D65, xyz)).map(encodeSRGB);
+  }
+
+  function hslToSRGB(h, s, l) {
+    const chroma = s * Math.min(l, 1 - l);
+    return [0, 8, 4].map(n => {
+      const k = (n + h / 30) % 12;
+      return l - chroma * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+    });
+  }
+
+  function parseAbsoluteColor(value, guarded) {
+    if (typeof value !== 'string' || value.length > (guarded ? 100 : 256) || /[^\t\n\f\r\x20-\x7e]/.test(value)) return null;
+    const input = trimColor(value).toLowerCase();
+    if (input === 'transparent' && !guarded) return { r: 0, g: 0, b: 0, a: 0 };
     const hex = /^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/.exec(input);
     if (hex) {
       const digits = hex[1].length <= 4 ? [...hex[1]].map(digit => digit + digit).join('') : hex[1];
       const [r, g, b, alpha = 255] = digits.match(/../g).map(part => parseInt(part, 16));
       return { r, g, b, a: alpha / 255 };
     }
-    const rgb = /^rgba?\(\s*([^()]+?)\s*\)$/.exec(input);
-    if (!rgb) return null;
-    const args = rgb[1];
-    let channels;
-    let alpha;
-    if (args.includes(',')) {
-      const parts = args.split(',').map(part => part.trim());
+    const fn = /^(rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\(([^()]*)\)$/.exec(input);
+    if (!fn) return null;
+    const [, kind, args] = fn;
+    const rgb = kind === 'rgb' || kind === 'rgba', hsl = kind === 'hsl' || kind === 'hsla';
+    if (guarded && !rgb) return null;
+    const legacy = args.includes(',');
+    const allowNone = !legacy && !guarded;
+    let channels, alpha;
+    if (legacy) {
+      if ((!rgb && !hsl) || args.includes('/')) return null;
+      const parts = args.split(',').map(trimColor);
       if (parts.length !== 3 && parts.length !== 4) return null;
       channels = parts.slice(0, 3);
       alpha = parts[3];
+      if (rgb && !guarded && !channels.every(token => token.endsWith('%') === channels[0].endsWith('%'))) return null;
+      if (hsl && !channels.slice(1).every(token => token.endsWith('%'))) return null;
     } else {
       const parts = args.split('/');
       if (parts.length > 2) return null;
-      channels = parts[0].trim().split(/\s+/);
-      alpha = parts[1]?.trim();
-      if (channels.length !== 3) return null;
+      channels = trimColor(parts[0]).split(/[\t\n\f\r ]+/);
+      alpha = parts.length === 2 ? trimColor(parts[1]) : undefined;
     }
-    const [r, g, b] = channels.map(channel => colorChannel(channel, 255));
-    const a = alpha === undefined ? 1 : colorChannel(alpha, 1);
-    return [r, g, b, a].every(Number.isFinite) ? { r, g, b, a } : null;
+    const space = kind === 'color' ? channels.shift() : null;
+    if (channels.length !== 3) return null;
+    if (guarded && /e/.test(args)) return null; // Preserve the existing remote hex/RGB numeric grammar.
+    const a = alpha === undefined ? 1 : colorComponent(alpha, 1, allowNone);
+    if (!Number.isFinite(a)) return null;
+    const component = (index, scale = 1) => colorComponent(channels[index], scale, allowNone);
+    let result;
+    if (rgb) {
+      const raw = channels.map((_, i) => component(i, 255));
+      if (!raw.every(Number.isFinite) || (guarded && (a < 0 || a > 1 || raw.some(n => n < 0 || n > 255)))) return null;
+      const [r, g, b] = raw.map(n => clampColor(n, 255));
+      return { r, g, b, a: clampColor(a) };
+    } else if (hsl || kind === 'hwb') {
+      const hue = hueDegrees(channels[0], allowNone);
+      const x = component(1, 100), y = component(2, 100);
+      if (![hue, x, y].every(Number.isFinite)) return null;
+      if (hsl) result = hslToSRGB(hue, clampColor(x / 100), clampColor(y / 100));
+      else {
+        const white = Math.max(0, x / 100), black = Math.max(0, y / 100);
+        if (white + black >= 1) result = Array(3).fill(white / (white + black));
+        else result = hslToSRGB(hue, 1, 0.5).map(n => white + n * (1 - white - black));
+      }
+    } else if (space !== null) {
+      const raw = channels.map((_, i) => component(i));
+      if (!raw.every(Number.isFinite)) return null;
+      if (space === 'srgb') result = raw;
+      else if (space === 'srgb-linear') result = raw.map(encodeSRGB);
+      else if (space === 'display-p3') result = multiplyColor(XYZ_TO_SRGB, multiplyColor(P3_TO_XYZ, raw.map(decodeSRGB))).map(encodeSRGB);
+      else return null;
+    } else {
+      const ok = kind.startsWith('ok'), polar = kind.endsWith('lch');
+      const maxLight = ok ? 1 : 100;
+      const l = component(0, maxLight), x = component(1, ok ? 0.4 : polar ? 150 : 125);
+      const y = polar ? hueDegrees(channels[2], allowNone) : component(2, ok ? 0.4 : 125);
+      if (![l, x, y].every(Number.isFinite)) return null;
+      const angle = y * Math.PI / 180, chroma = Math.max(0, x);
+      result = l <= 0 ? [0, 0, 0] : l >= maxLight ? [1, 1, 1] :
+        labToSRGB([l, polar ? chroma * Math.cos(angle) : x, polar ? chroma * Math.sin(angle) : y], ok);
+    }
+    // EyeCalm works in sRGB: clip at the destination, not in intermediate color spaces.
+    if (!result.every(Number.isFinite)) return null;
+    const [r, g, b] = result.map(channel => 255 * clampColor(channel));
+    return { r, g, b, a: clampColor(a) };
+  }
+
+  function parseColor(value) {
+    return parseAbsoluteColor(value, false);
   }
 
   function normalizeColor(value) {
@@ -107,8 +220,9 @@
     if (!color) return null;
     const { r, g, b, a = 1 } = color;
     if (![r, g, b, a].every(Number.isFinite) || a < 0 || a > 1 || [r, g, b].some(n => n < 0 || n > 255)) return null;
-    if (a === 0) return '#00000000';
-    const bytes = a === 1 ? [r, g, b] : [r, g, b, a * 255];
+    const alpha = Math.round(a * 255);
+    if (alpha === 0) return '#00000000';
+    const bytes = alpha === 255 ? [r, g, b] : [r, g, b, alpha];
     return `#${bytes.map(n => Math.round(n).toString(16).padStart(2, '0')).join('')}`;
   }
 
@@ -124,7 +238,7 @@
     let sector = (r - g) / chroma + 4;
     if (max === r) sector = (g - b) / chroma;
     else if (max === g) sector = (b - r) / chroma + 2;
-    return { h: (sector * 60 + 360) % 360, s: chroma / (1 - Math.abs(2 * l - 1)), l };
+    return { h: (sector * 60 + 360) % 360, s: clampColor(chroma / (1 - Math.abs(2 * l - 1))), l };
   }
 
   function luminance(value) {
@@ -153,25 +267,119 @@
 
   function themeSample(sample) {
     if (!sample || sample.hidden || sample.mask || sample.ui || sample.image) return null;
-    const opacity = sample.opacity ?? 1;
     const color = parseColor(sample.color);
-    return !Number.isFinite(opacity) || opacity < 0.5 || opacity > 1 || !color || color.a < 0.9
+    return (sample.opacity ?? 1) !== 1 || color?.a !== 1
       ? null : luminance(color) < 0.25 ? 'dark' : 'light';
   }
 
   // Each sample represents one hit stack (front to back). Declarations are in site-priority order.
   function detectTheme(samples = [], declarations = [], fallback = []) {
     let light = 0, dark = 0;
+    const canvas = fallback.map(themeSample).find(Boolean);
     for (const stack of samples) {
-      const mode = (Array.isArray(stack) ? stack : [stack]).map(themeSample).find(Boolean);
+      const mode = (Array.isArray(stack) ? stack : [stack]).map(themeSample).find(Boolean) ?? canvas;
       if (mode === 'light') light++;
       else if (mode === 'dark') dark++;
     }
     const confidence = light + dark ? Math.abs(light - dark) / (light + dark) : 0;
     const declared = declarations.find(mode => MODES.includes(mode));
-    const measured = light !== dark ? (light > dark ? 'light' : 'dark') : fallback.map(themeSample).find(Boolean);
+    const measured = light !== dark ? (light > dark ? 'light' : 'dark') : canvas;
     const mode = confidence < 0.2 && declared ? declared : measured || 'light';
     return { mode, confidence, confirmed: !!declared && declared === measured };
+  }
+
+  function themeClass(value) {
+    const modes = new Set((value || '').toLowerCase().split(/\s+/)
+      .map(token => token.replace(/^theme-/, '')).filter(token => MODES.includes(token)));
+    return modes.size === 1 ? modes.values().next().value : null;
+  }
+
+  function themeScheme(value) {
+    return /^(?:only\s+)?(dark|light)$|^(dark|light)\s+only$/.exec((value || '').trim().toLowerCase())?.slice(1).find(Boolean) ?? null;
+  }
+
+  function own(el) {
+    return el.hasAttribute('data-ec-ui') || el.hasAttribute('data-ec-style') || foreignOverlay(el);
+  }
+
+  function protectedMedia(el) {
+    return mediaTags.has(el.localName) || el.getAttribute('role') === 'img';
+  }
+
+  function composedParent(el) {
+    return el.assignedSlot || el.parentElement || el.getRootNode().host;
+  }
+
+  function viewportCoverage(rect, width, height) {
+    if (!rect || !width || !height) return 0;
+    const x = Math.max(0, Math.min(width, rect.right) - Math.max(0, rect.left));
+    const y = Math.max(0, Math.min(height, rect.bottom) - Math.max(0, rect.top));
+    return x * y / (width * height);
+  }
+
+  function hasMaskBackground(el, style, coverage) {
+    const name = ['class', 'id', 'data-testid'].map(attr => el.getAttribute(attr) || '').join(' ');
+    if (MASK_NAME.test(name)) return true;
+    if (!['fixed', 'absolute'].includes(style.position)) return false;
+    const sample = { position: style.position, color: style.backgroundColor, opacity: Number(style.opacity) };
+    return maskBackground({ ...sample, coverage: 1 }) && maskBackground({ ...sample, coverage: coverage(el) });
+  }
+
+  function appendCanvasProbe(document) {
+    const sample = document.createElement('i');
+    sample.setAttribute('data-ec-ui', '');
+    sample.setAttribute('data-ec-canvas', '');
+    sample.style.setProperty('display', 'none', 'important');
+    sample.style.setProperty('color', 'Canvas', 'important');
+    sample.style.setProperty('color-scheme', 'inherit', 'important');
+    sample.style.setProperty('animation', 'none', 'important');
+    sample.style.setProperty('transition', 'none', 'important');
+    document.documentElement.appendChild(sample);
+    return sample;
+  }
+
+  // Runtime and regression probe use the identical native 6 × 5 hit grid.
+  // A point without an opaque hit votes for the page canvas, not an abstention.
+  function readTheme(document, width, height, readStyle, readCanvas = () => {
+    const probe = appendCanvasProbe(document);
+    try { return readStyle(probe)?.color; }
+    finally { probe.remove(); }
+  }) {
+    const geometry = new Map();
+    function background(el) {
+      if (!el) return null;
+      if (geometry.has(el)) return geometry.get(el);
+      const style = readStyle(el);
+      if (!style) return null;
+      const ancestor = background(composedParent(el));
+      const sample = { el, color: style.backgroundColor,
+        opacity: Number(style.opacity) * (ancestor?.opacity ?? 1),
+        blocked: ancestor?.blocked || style.display === 'none' || style.contentVisibility === 'hidden',
+        ui: ancestor?.ui || own(el), mask: ancestor?.mask || hasMaskBackground(el, style,
+          node => viewportCoverage(safe(() => node.getBoundingClientRect(), null), width, height)),
+        image: style.backgroundImage !== 'none' || protectedMedia(el),
+      };
+      sample.hidden = sample.blocked || style.display === 'contents' || style.visibility !== 'visible';
+      geometry.set(el, sample);
+      return sample;
+    }
+
+    const grid = [];
+    for (let y = 0; y < 5; y++) for (let x = 0; x < 6; x++) {
+      const px = width * (x + 0.5) / 6, py = height * (y + 0.5) / 5;
+      grid.push(safe(() => document.elementsFromPoint(px, py), []).map(background).filter(Boolean));
+    }
+    const containers = [document.documentElement, document.body].filter(Boolean);
+    const names = ['data-theme', 'data-color-mode', 'data-mode', 'data-bs-theme'];
+    const declarations = [
+      ...containers.flatMap(el => names.map(name => el.getAttribute(name)?.trim().toLowerCase())),
+      ...containers.map(el => themeClass(el.getAttribute('class'))),
+      ...containers.map(el => themeScheme(readStyle(el)?.colorScheme)),
+      themeScheme(document.querySelector('meta[name="color-scheme" i]')?.content),
+    ];
+    const fallback = containers.map(background);
+    const canvas = fallback.some(themeSample) ? fallback : [...fallback, { color: readCanvas() }];
+    return { ...detectTheme(grid, declarations, canvas), grid, fallback };
   }
 
   function accentBackground(value) {
@@ -253,7 +461,8 @@
     const { h, s } = source;
     const channel = offset => {
       const k = (offset + h / 30) % 12;
-      return 255 * (lightness - s * Math.min(lightness, 1 - lightness) * Math.max(-1, Math.min(k - 3, 9 - k, 1)));
+      // The inverse HSL transform can overshoot RGB endpoints by an ulp.
+      return 255 * clampColor(lightness - s * Math.min(lightness, 1 - lightness) * Math.max(-1, Math.min(k - 3, 9 - k, 1)));
     };
     return normalizeColor({ r: channel(0), g: channel(8), b: channel(4), a: alpha });
   }
@@ -640,10 +849,7 @@
   }
 
   function canonicalColor(value) {
-    const color = typeof value === 'string' ? normalizeColor(value) : null;
-    if (color?.length !== 9) return color;
-    if (color.endsWith('00')) return '#00000000';
-    return color.endsWith('ff') ? color.slice(0, 7) : color;
+    return typeof value === 'string' ? normalizeColor(value) : null;
   }
 
   function variableNamePriority(name) {
@@ -929,7 +1135,7 @@
       const { prop, role } = entry;
       if (!COLOR_PROPS.includes(prop)) return warn('invalid-color-prop', { index });
       if (!AI_ROLES.includes(role)) return warn('invalid-color-role', { index });
-      const color = canonicalColor(entry.color);
+      const color = normalizeColor(parseAbsoluteColor(entry.color, true));
       if (!color || color === '#00000000') return warn('bad-color', { index });
       const key = `${prop}|${color}`;
       if (seen.has(key)) return warn('duplicate-color', { index, prop, color });
@@ -1666,7 +1872,8 @@
     normalizeTypography, aggregateTypography, measuredTextArea, localHealth, cachedHealth,
     normalizeFontScale, normalizeSitePreferences, resolveTextDepth, normalizeRestInterval, adjustFontScale,
     localDay, shouldSuggestScale, restState, reduceRest, restPromptDecision, restSyncEffect, fontScaleSource,
-    detectTheme, maskBackground, accentBackground, migrateSettings, activeHostLock, claimHostLease,
+    detectTheme, readTheme, themeSample, themeClass, themeScheme, sampleMotionCSS, maskBackground,
+    accentBackground, migrateSettings, activeHostLock, claimHostLease,
     liveDOMSize, mutationBuffer, watchHistory, foreignOverlay,
   };
 
@@ -2413,7 +2620,6 @@ function start() {
   const roles = ['bg', 'surface', 'fill', 'border', 'text', 'text2', 'text3', 'shadow'];
   const markerCSS = Object.entries(flags).flatMap(([prop, attr]) => roles.map(role =>
     `[${attr}="${role}"]{${properties[prop]}:var(--ec-${role})!important}`)).join('\n');
-  const mediaTags = new Set(['img', 'video', 'audio', 'canvas', 'svg', 'math', 'iframe', 'picture', 'object', 'embed']);
   const ignoredTags = new Set(['head', 'style', 'script', 'template', 'link', 'meta', 'noscript']);
   const maxNodes = 30000;
   const maxPendingChanges = 2048;
@@ -2432,8 +2638,6 @@ function start() {
     maskNames.map(name => `[${attr}*="${name}" i]`)).join(',')}))`;
   const shadows = new Map();
   const sampleMotionStyles = new Map();
-  const sampleMotionSelector = ':is(*,#ec-sample#ec-sample#ec-sample)';
-  const sampleMotionCSS = `${sampleMotionSelector},${sampleMotionSelector}::placeholder{transition-duration:0s!important;transition-delay:0s!important}`;
   const contrastRows = new Map();
   const contrastStyles = new Map();
   const contrastMotionStyles = new Map();
@@ -2457,9 +2661,6 @@ function start() {
   let paletteStyle, baseStyle, cacheStyle, overrideStyle, paintedMode;
   let status = 'off', run, rootObserver, themeObserver, observedBody, stopped = false;
   let themeCheckTimer, themeConfirmTimer, themeCandidate;
-  const safe = (operation, fallback) => {
-    try { return operation(); } catch { return fallback; }
-  };
   const fixture = safe(() => GM_getValue.eyecalmFixture === true, false);
   const darkPreference = safe(() => matchMedia('(prefers-color-scheme: dark)'), null);
   const storedMode = read(lastModeKey, null);
@@ -2704,8 +2905,7 @@ function start() {
     }
   }
 
-  function withoutPaint(task) {
-    if (!styles.size || !paintedMode) return withoutStyles(styles, task);
+  function withoutMotion(task) {
     const scopes = new Set([root, ...[...shadows.keys()].filter(scope => scope.host.isConnected)]);
     for (const [scope, guard] of sampleMotionStyles) {
       if (scopes.has(scope)) continue;
@@ -2721,13 +2921,21 @@ function start() {
       }
       guard.media = 'all';
     }
-    try { return withoutStyles(styles, task); }
+    try { return task(); }
     finally {
       // Commit restored paint before re-enabling transitions. Otherwise the next
       // style read can start a reverse transition and queue another native scan.
       void root.offsetWidth;
       for (const guard of sampleMotionStyles.values()) guard.media = 'not all';
     }
+  }
+
+  function withoutPaint(task) {
+    return styles.size && paintedMode ? withoutMotion(() => withoutStyles(styles, task)) : withoutStyles(styles, task);
+  }
+
+  function withoutContrastPaint(task) {
+    return contrastStyles.size ? withoutMotion(() => withoutStyles(contrastStyles.values(), task)) : task();
   }
 
   function clearMarker(el) {
@@ -2888,52 +3096,11 @@ function start() {
   }
 
   function isMask(el, style) {
-    const name = ['class', 'id', 'data-testid'].map(attr => el.getAttribute(attr) || '').join(' ');
-    if (MASK_NAME.test(name)) return true;
-    if (!['fixed', 'absolute'].includes(style.position)) return false;
-    const candidate = { position: style.position, color: style.backgroundColor, opacity: Number(style.opacity) };
-    return Core.maskBackground({ ...candidate, coverage: 1 }) && Core.maskBackground({ ...candidate, coverage: coverage(el) });
+    return hasMaskBackground(el, style, coverage);
   }
 
   function measureTheme() {
-    return measureWithoutZoom(() => withoutPaint(() => {
-      const geometry = new Map();
-      function background(el) {
-        if (!el) return null;
-        if (geometry.has(el)) return geometry.get(el);
-        const style = rootStyle(el);
-        if (!style) return null;
-        const ancestor = background(composedParent(el));
-        const sample = { el, color: style.backgroundColor,
-          opacity: Number(style.opacity) * (ancestor?.opacity ?? 1),
-          blocked: ancestor?.blocked || style.display === 'none' || style.contentVisibility === 'hidden',
-          ui: ancestor?.ui || own(el), mask: ancestor?.mask || isMask(el, style),
-          image: style.backgroundImage !== 'none' || protectedMedia(el),
-        };
-        sample.hidden = sample.blocked || style.display === 'contents' || style.visibility !== 'visible';
-        geometry.set(el, sample);
-        return sample;
-      }
-      const grid = [];
-      for (let y = 0; y < 5; y++) for (let x = 0; x < 6; x++) {
-        const px = innerWidth * (x + 0.5) / 6, py = innerHeight * (y + 0.5) / 5;
-        grid.push(safe(() => document.elementsFromPoint(px, py), []).map(background).filter(Boolean));
-      }
-      const containers = [root, document.body].filter(Boolean);
-      const names = ['data-theme', 'data-color-mode', 'data-mode', 'data-bs-theme'];
-      const scheme = value => {
-        const modes = [...new Set((value || '').toLowerCase().split(/\s+/).filter(part => MODES.includes(part)))];
-        return modes.length === 1 ? modes[0] : null;
-      };
-      const declarations = [
-        ...containers.flatMap(el => names.map(name => el.getAttribute(name)?.trim().toLowerCase())),
-        ...containers.map(el => scheme((el.getAttribute('class') || '').replace(/\btheme-(dark|light)\b/gi, '$1'))),
-        ...containers.map(el => scheme(rootStyle(el)?.colorScheme)),
-        scheme(document.querySelector('meta[name="color-scheme" i]')?.content),
-      ];
-      const fallback = containers.map(background);
-      return { ...Core.detectTheme(grid, declarations, fallback), grid, fallback };
-    }));
+    return measureWithoutZoom(() => withoutPaint(() => Core.readTheme(document, innerWidth, innerHeight, rootStyle, canvasColor)));
   }
 
   function classSelector(el) {
@@ -2943,14 +3110,6 @@ function start() {
     return `[class="${names}"]`;
   }
 
-  function own(el) {
-    return el.hasAttribute('data-ec-ui') || el.hasAttribute('data-ec-style') || Core.foreignOverlay(el);
-  }
-
-  function protectedMedia(el) {
-    return mediaTags.has(el.localName) || el.getAttribute('role') === 'img';
-  }
-
   function followable(el) {
     for (let node = el; node; node = composedParent(node)) {
       if (own(node) || protectedMedia(node) || ignoredTags.has(node.localName)) return false;
@@ -2958,25 +3117,21 @@ function start() {
     return true;
   }
 
-  function composedParent(el) {
-    return el.assignedSlot || el.parentElement || el.getRootNode().host;
+  function hasContrastText(el) {
+    if (CONTRAST_TAGS.has(el.localName)) return true;
+    for (let child = el.firstChild; child; child = child.nextSibling) {
+      if (child.nodeType === 3 && /\S/.test(child.nodeValue)) return true;
+    }
+    return false;
   }
 
-  function hasContrastText(el) {
-    return CONTRAST_TAGS.has(el.localName) || Array.from(el.childNodes).some(node => node.nodeType === 3 && /\S/.test(node.nodeValue));
+  function canvasColor() {
+    if (!canvasProbe?.isConnected) canvasProbe = appendCanvasProbe(document);
+    return rootStyle(canvasProbe)?.color;
   }
 
   function canvasContext() {
-    if (!canvasProbe?.isConnected) {
-      canvasProbe = document.createElement('i');
-      canvasProbe.setAttribute('data-ec-ui', '');
-      canvasProbe.setAttribute('data-ec-canvas', '');
-      canvasProbe.hidden = true;
-      canvasProbe.style.setProperty('color', 'Canvas', 'important');
-      root.appendChild(canvasProbe);
-    }
-    const background = Core.parseColor(rootStyle(canvasProbe)?.color);
-    return { background, black: Core.parseColor('#000'), weight: 1 };
+    return { background: Core.parseColor(canvasColor()), black: Core.parseColor('#000'), weight: 1 };
   }
 
   // Render a fully opaque probe glyph and a blank pixel through each ancestor's opacity group.
@@ -3225,7 +3380,7 @@ function start() {
           if (row) updates.set(el, [row]);
         }
       });
-      withoutStyles(contrastStyles.values(), () => {
+      withoutContrastPaint(() => {
         for (const [el, [original]] of updates) {
           if (!retainedInk(el, original, original.preserve ? readContrast(el, backdrops, canvas) : [])) updates.delete(el);
         }
@@ -3278,12 +3433,12 @@ function start() {
     return { palette: settings.palette, mode: paintedMode, depth: paintedDepth, entries };
   }
 
-  async function measureContrast(w, elements) {
+  async function measureContrast(w, elements, { foreground = false, sampled = false } = {}) {
     if (!paintedMode || !live(w)) return;
     const revision = contrastRevision;
     const originals = new Map(), originalCursor = elements[Symbol.iterator]();
     let originalBackdrops, originalCanvas;
-    await slices(w, () => {
+    if (!sampled) await slices(w, () => {
       if (revision !== contrastRevision) return true;
       const next = originalCursor.next();
       if (next.done) return true;
@@ -3294,7 +3449,7 @@ function start() {
       originalBackdrops = new WeakMap();
       originalCanvas = canvasContext();
       return task();
-    }));
+    }), foreground);
     if (!live(w) || revision !== contrastRevision) return;
     const cursor = elements[Symbol.iterator]();
     const updates = new Map();
@@ -3303,13 +3458,14 @@ function start() {
       if (revision !== contrastRevision) return true;
       const next = cursor.next();
       if (next.done) return true;
-      updates.set(next.value, contrastFor(next.value, backdrops, canvas, originals.get(next.value)));
+      const original = sampled && w.nativeInk.has(next.value) ? w.nativeInk.get(next.value) : originals.get(next.value);
+      updates.set(next.value, contrastFor(next.value, backdrops, canvas, original));
       return false;
     }, null, task => {
       backdrops = new WeakMap();
       canvas = canvasContext();
-      return withoutStyles(contrastStyles.values(), task);
-    });
+      return withoutContrastPaint(task);
+    }, foreground);
     if (!live(w) || revision !== contrastRevision) return;
     for (const [el, rows] of updates) setContrastRows(el, rows);
     updateContrastStyles();
@@ -3343,7 +3499,7 @@ function start() {
     }).catch(() => {});
   }
 
-  function* elements(first, w, pruning = false) {
+  function* elements(first, w, pruning = false, coversShadow = false) {
     const frames = [{ node: first, siblings: false }];
     while (frames.length) {
       const { node: el, siblings } = frames.pop();
@@ -3355,19 +3511,14 @@ function start() {
       if (el.firstElementChild) frames.push({ node: el.firstElementChild, siblings: true });
       const shadow = safe(() => el.shadowRoot, null);
       if (shadow) {
-        if (!pruning) watchShadow(w, shadow);
+        if (!pruning) watchShadow(w, shadow, coversShadow);
         if (shadow.firstElementChild) frames.push({ node: shadow.firstElementChild, siblings: true });
       }
     }
   }
 
   function coverage(el) {
-    const rect = safe(() => el.getBoundingClientRect(), null);
-    if (!rect) return 0;
-    const width = Math.max(1, innerWidth), height = Math.max(1, innerHeight);
-    const x = Math.max(0, Math.min(width, rect.right) - Math.max(0, rect.left));
-    const y = Math.max(0, Math.min(height, rect.bottom) - Math.max(0, rect.top));
-    return x * y / (width * height);
+    return viewportCoverage(safe(() => el.getBoundingClientRect(), null), innerWidth, innerHeight);
   }
 
   const proseSelector = 'p,blockquote,pre,dd,dt,article,[role="article"],[itemprop="articleBody"]';
@@ -3451,14 +3602,24 @@ function start() {
     const style = rootStyle(el);
     if (!style) return null;
     const mask = isMask(el, style);
-    const unknown = !textBackdrop(el, w.originalBackdrops, w.originalCanvas);
+    const backdrop = textBackdrop(el, w.originalBackdrops, w.originalCanvas);
+    const unknown = !backdrop;
     const semantic = el.hasAttribute('aria-invalid') || /^(alert|status|progressbar)$/.test(el.getAttribute('role') || '') ||
       /(?:^|[-_ ])(?:error|warning|success|danger|alert)(?:$|[-_ ])/i.test(el.getAttribute('class') || '');
     const area = firstView && style.display !== 'none' && style.visibility === 'visible' ? coverage(el) : 0;
     const image = !!style.backgroundImage && style.backgroundImage !== 'none';
     const bg = image ? null : normalize(style.backgroundColor);
+    // A white tint on a dark code island still renders dark. Painting the tint as
+    // an opaque paper role would erase the contrast of the site's code theme.
+    const codeAlpha = w.mode === 'light' && (el.localName === 'pre' || el.localName === 'code') && backdrop && bg
+      ? Core.parseColor(style.backgroundColor)?.a : 0;
+    const darkCodeOverlay = codeAlpha > 0 && codeAlpha < 1 && Core.luminance(backdrop.background) < 0.25;
     const text = normalize(style.color);
     const accent = !unknown && accentButtonText(el, Core.parseColor(style.webkitTextFillColor || style.color));
+    const ink = hasContrastText(el);
+    const preserve = mask || unknown;
+    const original = ink && text && (preserve || accent) ? { kind: 'text', color: text,
+      fillColor: normalize(style.webkitTextFillColor) || text, ...(preserve ? { preserve } : { accent }) } : null;
     const typography = firstView && (area || style.display === 'contents') && Core.parseColor(text)?.a > 0.01
       ? typographySample(el, style, w) : null;
     let border = null, seenBorder = false;
@@ -3481,7 +3642,7 @@ function start() {
         if (value) rememberVariable(w.variables, name, selector, value, scope);
       }
     }
-    return { el, area, bg, text, border, semantic, selector, scope, kept: image, mask, unknown, accent, typography,
+    return { el, area, bg, text, border, semantic, selector, scope, kept: image, darkCodeOverlay, mask, unknown, accent, typography, ink, original,
       isRoot: el === root || el === document.body || el === w.canvasElement };
   }
 
@@ -3556,9 +3717,9 @@ function start() {
     return run === w && !w.controller.signal.aborted && enabled();
   }
 
-  function slices(w, step, flush, original = true) {
+  function slices(w, step, flush, original = true, foreground = false) {
     return new Promise((resolve, reject) => {
-      const schedule = callback => typeof requestIdleCallback === 'function'
+      const schedule = callback => !foreground && typeof requestIdleCallback === 'function'
         ? requestIdleCallback(callback, { timeout: 60 }) : setTimeout(() => callback(null), 0);
       let done = false, unwritten = false;
       function batch(deadline) {
@@ -3658,6 +3819,7 @@ function start() {
     w.darkBaseLightness = darkBase ? Core.hsl(darkBase).l : null;
     const classify = (record, prop) => Core.classifyColor(record[prop], prop, mode, {
       root: record.isRoot, semantic: record.semantic, darkBaseLightness: w.darkBaseLightness,
+      protected: prop === 'bg' && record.darkCodeOverlay,
     });
     const keepArea = record => record && !record.mask && (record.kept || (record.bg && Core.parseColor(record.bg)?.a > 0.1 &&
       classify(record, 'bg') === 'keep'));
@@ -3709,7 +3871,7 @@ function start() {
     if (record.mask || (prop === 'text' && (record.unknown || record.accent))) return 'keep';
     return Core.resolveColorRole(record[prop], prop, w.mapping, {
       root: record.isRoot, semantic: record.semantic, darkBaseLightness: w.darkBaseLightness,
-      protected: record.kept && prop === 'bg', paintCanvas: record.el === root && w.paintCanvas,
+      protected: prop === 'bg' && (record.kept || record.darkCodeOverlay), paintCanvas: record.el === root && w.paintCanvas,
     });
   }
 
@@ -3758,9 +3920,10 @@ function start() {
       if (!masks.has(record.el)) record.el.setAttribute(maskFlag, '');
       masks.add(record.el);
     } else if (masks.delete(record.el)) record.el.removeAttribute(maskFlag);
-    if (hasContrastText(record.el)) {
+    if (record.ink) {
       w.contrastCandidates.add(record.el);
       w.contrastDirty.add(record.el);
+      w.nativeInk.set(record.el, record.original);
     } else if (w.contrastCandidates.delete(record.el)) w.contrastDirty.add(record.el);
     const paletteRoles = Object.fromEntries(Object.keys(properties).map(prop => [prop, selectRole(w, record, prop)]));
     const selector = record.scope !== document ? null : record.el === root ? ':root' :
@@ -3829,7 +3992,7 @@ function start() {
       if (index === w.view.length) return true;
       applyRecord(w, w.view[index++]);
       return false;
-    }, null, false);
+    }, null, false, true);
     if (!live(w)) return;
     if (keepFast || stage) {
       if (stage) enableStyles();
@@ -3846,7 +4009,7 @@ function start() {
         sheets.overrides = null;
       }
     }
-    await measureContrast(w, w.contrastCandidates);
+    await measureContrast(w, w.contrastCandidates, { foreground: true, sampled: true });
   }
 
   function installShadow(scope) {
@@ -3856,12 +4019,42 @@ function start() {
     shadows.set(scope, sheets);
   }
 
+  const motionProperties = new Set(['transform', 'transform-style', 'translate', 'rotate', 'scale', 'will-change']);
+  let styleBefore;
+  function onlyMotionChanged(el, previous) {
+    if (!previous || !el.style || ![...el.style].some(name => motionProperties.has(name))) return false;
+    styleBefore ||= document.createElement('i').style;
+    styleBefore.cssText = previous;
+    for (const style of [styleBefore, el.style]) {
+      const other = style === styleBefore ? el.style : styleBefore;
+      for (const name of style) {
+        if (!motionProperties.has(name) && (style.getPropertyValue(name) !== other.getPropertyValue(name) ||
+          style.getPropertyPriority(name) !== other.getPropertyPriority(name))) return false;
+      }
+    }
+    return true;
+  }
+
   function observe(w, scope) {
     const observer = new MutationObserver(raw => {
       if (!live(w)) return;
       const accepted = w.mutations.add(raw, record => {
         const target = record.target.nodeType === 1 ? record.target : record.target.parentElement;
         if (target && own(target)) return false;
+        if (record.type === 'attributes') {
+          const value = target.getAttribute(record.attributeName);
+          if (value === record.oldValue) return false;
+          if (record.attributeName !== 'style') return true;
+          // An animation can emit dozens of attribute records per frame, even
+          // on protected media or on an image-only ornament with no ink to fix.
+          if (protectedMedia(target)) return false;
+          if (onlyMotionChanged(target, record.oldValue) && (!nearViewport(target) ||
+            (!target.childElementCount && !hasContrastText(target) && imageLayer(target, rootStyle(target))))) {
+            w.geometryDirty = true;
+            return false;
+          }
+          return true;
+        }
         if (record.type !== 'childList') return true;
         for (const nodes of [record.addedNodes, record.removedNodes]) {
           for (const node of nodes) if (node.nodeType === 1 ? !own(node) : node.nodeType === 3) return true;
@@ -3871,17 +4064,17 @@ function start() {
       if (accepted && performance.now() < w.routeUntil) queueViewport(w);
       if (w.mutations.pending) scheduleChanges(w);
     });
-    observer.observe(scope, { childList: true, subtree: true, attributes: true, characterData: true,
+    observer.observe(scope, { childList: true, subtree: true, attributes: true, attributeOldValue: true, characterData: true,
       attributeFilter: contrastAttributes });
     w.observers.set(scope, observer);
   }
 
-  function watchShadow(w, scope) {
+  function watchShadow(w, scope, covered = false) {
     const discovered = !w.observers.has(scope);
     if (discovered) observe(w, scope);
     if (w.mapping) installShadow(scope);
     if (discovered && w.finished) {
-      queueRoot(w, scope.host, true);
+      if (!covered) queueRoot(w, scope.host, true);
       if (w.mapping.css) {
         const sheets = shadows.get(scope);
         sheets.overrides = replaceStyle(scope, sheets.overrides, 'shadow-overrides', guardedCSS(w.mapping.css));
@@ -3923,31 +4116,7 @@ function start() {
 
   function queueViewport(w) {
     w.viewportPending = true;
-    paintViewport(w);
-  }
-
-  async function paintViewport(w) {
-    if (!w.finished || w.viewportRunning || !w.viewportPending || !live(w)) return;
-    w.viewportRunning = true;
-    w.viewportPending = false;
-    const cursor = viewportElements(w), changes = [];
-    try {
-      // A route can change while an earlier subtree or its contrast is still being processed.
-      await slices(w, () => {
-        const next = cursor.next();
-        if (next.done) return true;
-        const record = sample(next.value, w, false);
-        if (record) changes.push(record);
-        return false;
-      }, end => flushRecords(changes, end, record => applyRecord(w, record)), task => sampleOriginal(w, task));
-    } catch { /* Mutation processing remains available if viewport sampling fails. */ }
-    finally {
-      w.viewportRunning = false;
-      if (live(w)) {
-        paintViewport(w);
-        scheduleChanges(w);
-      }
-    }
+    scheduleChanges(w);
   }
 
   function scheduleChanges(w) {
@@ -3988,6 +4157,26 @@ function start() {
     }
   }
 
+  function coalesceMutationRoots(tasks, large) {
+    const liveRoots = new Map(), detached = new Set();
+    for (const task of tasks) {
+      const el = task?.el;
+      if (el?.nodeType !== 1 || own(el)) continue;
+      if (!el.isConnected || !followable(el)) detached.add(el);
+      else if (!task.remove) liveRoots.set(el, !!task.added || !!liveRoots.get(el));
+    }
+    // Stylesheet insertions/removals and load events may all target the same
+    // root. Skipping duplicate *samples* still walks every descendant each time.
+    const roots = [...liveRoots].filter(([el]) => {
+      for (let parent = el.parentElement || el.getRootNode().host; parent;
+        parent = parent.parentElement || parent.getRootNode().host) {
+        if (liveRoots.has(parent) && (!large || liveRoots.get(parent))) return false;
+      }
+      return true;
+    }).map(([el, added]) => ({ el, added, remove: false }));
+    return [...detached].map(el => ({ el, remove: true })).concat(roots);
+  }
+
   function forgetElement(w, el) {
     updateVotes(w, el, null);
     if (marked.has(el)) clearMarker(el);
@@ -4024,81 +4213,141 @@ function start() {
       rect.bottom > -margin && rect.top < innerHeight + margin;
   }
 
-  async function drainChanges(w) {
-    if (!w.finished || w.drain || !live(w) || !w.mapping ||
-        !(w.queued.size || w.rescan || w.mutations.pending || w.contrastDirty.size)) return;
-    w.drain = true;
-    root.setAttribute('data-ec-updating', '');
-    const touched = new WeakSet();
+  function changesPending(w) {
+    return w.startup || w.background.length || w.viewportPending || w.queued.size || w.rescan || w.mutations.pending || w.contrastDirty.size;
+  }
+
+  function* mutationWork(w, tasks, overflow, touched) {
     const removed = new WeakSet();
-    const batch = w.mutations.take(), pending = w.queued;
-    let large = Core.liveDOMSize(document) > maxNodes;
-    const overflow = batch.rescan || w.rescan;
-    const rescan = overflow || (w.large && !large);
-    w.large = large;
-    w.queued = new Map();
-    w.rescan = false;
-    const roots = mutationRoots(batch.records, rescan && !large ? new Map([[root, false]]) : pending);
-    // A coalesced rescan cannot enumerate detached subtrees from the discarded records.
-    let sweep = overflow ? trackedElements(w) : null;
-    let cursor, cursorRoot, pruning, added, requestedViewport = false;
-    const prioritizeViewport = () => {
-      if (!requestedViewport) { requestedViewport = true; queueViewport(w); }
-    };
-    if (rescan) prioritizeViewport();
     const forget = el => {
       if (!removed.has(el) && (!el.isConnected || !followable(el))) {
         removed.add(el);
         forgetElement(w, el);
       }
     };
+    // A coalesced rescan cannot enumerate detached subtrees from the discarded records.
+    if (overflow) for (const el of trackedElements(w)) { forget(el); yield; }
+    let coveredRoot = false;
+    for (const { el: target, remove, added } of tasks) {
+      yield;
+      const pruning = remove || !followable(target);
+      if (pruning ? target.isConnected && followable(target) : !target.isConnected) continue;
+      if (!pruning && !added && w.large) {
+        if (nearViewport(target) && !touched.has(target)) { touched.add(target); yield target; }
+        continue;
+      }
+      for (const el of elements(target, w, pruning, true)) {
+        if (!pruning && (!target.isConnected || (!added && w.large))) break;
+        if (pruning) forget(el);
+        else if (!touched.has(el)) { touched.add(el); yield el; continue; }
+        yield;
+      }
+      if (target === root && !pruning && !w.large) coveredRoot = true;
+    }
+    return coveredRoot;
+  }
+
+  async function drainChanges(w) {
+    if (!w.finished || w.drain || !live(w) || !w.mapping || !changesPending(w)) return;
+    w.drain = true;
+    if (!root.hasAttribute('data-ec-updating')) root.setAttribute('data-ec-updating', '');
+    const touched = new WeakSet();
+    const batch = w.mutations.take(), pending = w.queued;
+    const large = Core.liveDOMSize(document) > maxNodes;
+    const startupCancelled = large && !!w.startup;
+    if (startupCancelled) w.startup = null;
+    const overflow = batch.rescan || w.rescan || w.background.length >= 8;
+    if (overflow) w.background.length = 0;
+    const rescan = overflow || (w.large && !large);
+    w.large = large;
+    w.queued = new Map();
+    w.rescan = false;
+    const tasks = coalesceMutationRoots(mutationRoots(batch.records, rescan && !large ? new Map([[root, false]]) : pending), large);
+    const collectHits = w.viewportPending || startupCancelled || rescan || large && tasks.length > 0;
+    w.viewportPending = false;
     const changes = [];
-    await slices(w, () => {
-      if (sweep) {
-        const next = sweep.next();
-        if (!next.done) { forget(next.value); return false; }
-        sweep = null;
-      }
-      if (cursor && !pruning && !cursorRoot.isConnected) cursor = null;
-      if (!cursor) {
-        const next = roots.next();
+    const sampleChange = el => {
+      w.sampled?.add(el);
+      const record = sample(el, w, false);
+      if (record) changes.push(record);
+    };
+    const flush = end => flushRecords(changes, end, record => applyRecord(w, record));
+    const repairDirty = async () => {
+      if (!live(w) || !w.contrastDirty.size) return;
+      const dirty = w.contrastDirty;
+      w.contrastDirty = new Set();
+      await measureContrast(w, dirty, { foreground: true, sampled: true });
+    };
+
+    if (collectHits || tasks.length) {
+      // Fix visible descendants before traversing a mutated subtree or continuing
+      // the initial crawl. In particular, a late SPA batch can change both.
+      const scopeRoots = new Set(tasks.filter(task => !task.remove).map(task => task.el));
+      const visible = (function* () {
+        yield* scopeRoots;
+        for (const el of w.foreground) {
+          if (!el.isConnected) { w.foreground.delete(el); continue; }
+          for (let node = el; node; node = composedParent(node)) {
+            if (scopeRoots.has(node)) { yield el; break; }
+          }
+        }
+        if (collectHits) yield* viewportElements(w);
+      })();
+      await slices(w, () => {
+        const next = visible.next();
         if (next.done) return true;
-        const task = next.value;
-        if (!task || task.el.nodeType !== 1 || own(task.el)) return false;
-        pruning = task.remove || !followable(task.el);
-        if (pruning && task.el.isConnected && followable(task.el)) return false;
-        if (!pruning && !task.el.isConnected) return false;
-        cursorRoot = task.el;
-        added = task.added;
-        if (large && !pruning && !added) {
-          prioritizeViewport();
-          if (!nearViewport(task.el)) return false;
-          cursor = [task.el][Symbol.iterator]();
-        } else cursor = elements(task.el, w, pruning);
-      }
-      const item = cursor.next();
-      if (item.done) { cursor = null; return false; }
-      const el = item.value;
-      if (pruning) {
-        forget(el);
+        const el = next.value;
+        if (el.isConnected && !touched.has(el) && followable(el) && nearViewport(el)) {
+          if (w.foreground.size < maxView) w.foreground.add(el);
+          touched.add(el);
+          sampleChange(el);
+        }
         return false;
-      }
-      if (!touched.has(el)) {
-        touched.add(el);
-        const record = sample(el, w, false);
-        if (record) changes.push(record);
+      }, flush, task => sampleOriginal(w, task), true);
+      // Variable-based profiles may depend on newly matching selectors. Commit
+      // their styles before reading the foreground's resulting contrast.
+      if (!w.mapping.varRoles.length) await repairDirty();
+    }
+    if (!live(w)) return;
+    if (tasks.length || overflow) w.background.push(mutationWork(w, tasks, overflow, touched));
+    let steps = 0, startupCompleted = startupCancelled, finishedWork = false;
+    await slices(w, () => {
+      // Bound each background turn. A newer visible mutation/route is processed
+      // before the next turn, not after an entire offscreen subtree or rescan.
+      if (steps++ >= 1200) return true;
+      if (w.background.length) {
+        const item = w.background[0].next();
+        if (item.done) {
+          w.background.shift();
+          finishedWork = true;
+          if (item.value && w.startup) {
+            w.startup = null;
+            startupCompleted = true;
+          }
+        } else if (item.value) sampleChange(item.value);
+      } else if (w.startup) {
+        const item = w.startup.next();
+        if (item.done) {
+          w.startup = null;
+          startupCompleted = true;
+        } else if (!w.sampled.has(item.value)) sampleChange(item.value);
+      } else {
+        return true;
       }
       return false;
-    }, end => flushRecords(changes, end, record => applyRecord(w, record)), task => {
-      if (!large && Core.liveDOMSize(document) > maxNodes) {
-        large = w.large = true;
-        if (!pruning && !added) cursor = null;
-        prioritizeViewport();
+    }, flush, task => {
+      if (!w.large && Core.liveDOMSize(document) > maxNodes) {
+        w.large = true;
+        if (w.startup) {
+          w.startup = null;
+          startupCompleted = true;
+        }
+        queueViewport(w);
       }
       return sampleOriginal(w, task);
     });
     let overridesChanged = false;
-    if (live(w) && w.mapping.varRoles.length) {
+    if (live(w) && w.mapping.varRoles.length && (tasks.length || finishedWork || startupCompleted)) {
       await discoverDefinitions(w);
       if (live(w)) overridesChanged = updateOverrides(w);
     }
@@ -4106,13 +4355,20 @@ function start() {
       const dirty = w.contrastDirty;
       w.contrastDirty = new Set();
       if (dirty.size || overridesChanged) {
-        await measureContrast(w, overridesChanged ? new Set([...w.contrastCandidates, ...dirty]) : dirty);
+        await measureContrast(w, overridesChanged ? new Set([...w.contrastCandidates, ...dirty]) : dirty, { sampled: true });
       }
-      if (live(w)) persistContrast(w);
+      if (live(w)) {
+        const compiled = startupCompleted && w.rebuildCacheCSS ? fastCSS(w) : undefined;
+        if (startupCompleted) {
+          w.votes = w.sampled = null;
+          w.groups.clear();
+        }
+        persistContrast(w, compiled);
+      }
     }
     w.drain = false;
     if (!live(w)) return;
-    if (w.queued.size || w.rescan || w.mutations.pending || w.contrastDirty.size) scheduleChanges(w);
+    if (changesPending(w)) scheduleChanges(w);
     else root.removeAttribute('data-ec-updating');
   }
 
@@ -4244,13 +4500,13 @@ function start() {
     await slices(w, () => iterator.next().done);
   }
 
-  function fastCSS(w) {
+  function fastCSS(w, firstOnly = false) {
     const overrides = compileOverrides(w, document);
     const classRules = [];
     const limit = Math.max(0, 400 - overrides.length - w.mapping.css.split('\n').filter(Boolean).length);
     for (const [key, group] of w.groups) {
       if (classRules.length >= limit) break;
-      if (group.count < 2 && ![':root', 'body'].includes(key)) continue;
+      if ((firstOnly || group.count < 2) && ![':root', 'body'].includes(key)) continue;
       const declarations = Object.entries(group.roles).flatMap(([prop, counts]) => {
         const role = counts.keys().next().value;
         return counts.size === 1 && roles.includes(role) ? [{ property: properties[prop], role }] : [];
@@ -4275,46 +4531,28 @@ function start() {
     }
   }
 
-  async function finish(w, iterator, result, kind, mode, { entry = null, aiFailedAt } = {}) {
+  async function finish(w, result, kind, mode, { entry = null, aiFailedAt } = {}) {
     if (!live(w) || !themeStillCurrent(w)) return;
     const overrides = kind === 'ai' ? healthOverrides(result.healthOverrides) : {};
     const health = profileHealth(w.localHealth, overrides);
     setCurrentHealth(health, overrides);
     await applyProfile(w, result, kind, mode, !!entry);
-    if (!live(w)) return;
+    if (!live(w) || !currentGeneration(w) || !themeStillCurrent(w)) return;
+    // Apply, measure (including the first-view guard), and persist one generation
+    // before declaring it committed. The remainder is genuine DOM update work,
+    // not an outstanding AI request.
+    w.foreground = new Set(w.view.map(record => record.el));
     w.view = [];
     w.large = Core.liveDOMSize(document) > maxNodes;
-    let remaining = w.large ? viewportElements(w) : iterator;
-    const samples = [];
-    await slices(w, () => {
-      const next = remaining.next();
-      if (next.done) return true;
-      const el = next.value;
-      if (w.sampled.has(el)) return false;
-      w.sampled.add(el);
-      const record = sample(el, w, false);
-      if (record) samples.push(record);
-      return false;
-    }, end => flushRecords(samples, end, record => applyRecord(w, record)), task => {
-      if (!w.large && Core.liveDOMSize(document) > maxNodes) {
-        w.large = true;
-        remaining = viewportElements(w);
-      }
-      return sampleOriginal(w, task);
-    });
-    if (!live(w)) return;
-    if (w.mapping.varRoles.length) await discoverDefinitions(w);
-    if (!live(w) || !currentGeneration(w) || !themeStillCurrent(w)) return;
-    updateOverrides(w);
-    const compiledCss = fastCSS(w);
-    // Selector votes are only needed for the startup cache, not for the lifetime of the SPA.
-    w.votes = w.sampled = null;
-    w.groups.clear();
-    deleteStyle(cacheStyle);
-    cacheStyle = null;
-    probeShadows(w);
-    await measureContrast(w, w.contrastCandidates);
-    if (!live(w) || !currentGeneration(w) || !themeStillCurrent(w)) return;
+    w.startup = w.large ? null : elements(root, w, false, true);
+    w.rebuildCacheCSS = !entry;
+    // Shared class votes are not safe for a warm load until the background
+    // crawl can detect conflicting roles on another instance of the class.
+    const compiledCss = entry?.compiledCss ?? fastCSS(w, !!w.startup);
+    if (!w.startup) {
+      w.votes = w.sampled = null;
+      w.groups.clear();
+    }
     w.contrastDirty.clear();
     w.finished = true;
     const contrastFixes = collectContrastFixes();
@@ -4338,7 +4576,7 @@ function start() {
       putProfile(saved, w);
     }
     setStatus(entry ? 'cached' : kind);
-    paintViewport(w);
+    probeShadows(w);
     scheduleChanges(w);
   }
 
@@ -4361,7 +4599,7 @@ function start() {
     observe(w, document);
     const cssStateChange = event => {
       const el = event.composedPath()[0];
-      if (el?.nodeType !== 1 || !live(w) || own(el)) return;
+      if (el?.nodeType !== 1 || !live(w) || own(el) || protectedMedia(el)) return;
       if (event.type === 'load' && el.localName !== 'link') return;
       if (event.type === 'transitionend' && !/^(?:background(?:-color)?|color|opacity|-webkit-text-fill-color|filter|backdrop-filter)$/.test(event.propertyName)) return;
       if (event.type !== 'load' && event.type !== 'transitionend' && !['input', 'textarea', 'select', 'button'].includes(el.localName)) return;
@@ -4372,7 +4610,7 @@ function start() {
       document.addEventListener(type, cssStateChange, { capture: true, signal: w.controller.signal });
     }
     const viewportMoved = () => {
-      if (!w.large || !live(w) || w.viewportTimer != null) return;
+      if ((!w.large && !w.geometryDirty && !w.startup) || !live(w) || w.viewportTimer != null) return;
       w.viewportTimer = setTimeout(() => {
         w.viewportTimer = null;
         if (live(w)) queueViewport(w);
@@ -4388,8 +4626,11 @@ function start() {
     w.typographyContexts = new WeakMap();
     const cursor = elements(root, w);
     const limited = w.domSize > maxNodes;
-    const viewport = limited ? viewportElements(w) : viewportCandidates(w);
-    let viewportDone = false, count = 0;
+    const viewport = (function* () {
+      yield* viewportCandidates(w);
+      yield* viewportElements(w);
+    })();
+    let viewportDone = false, count = 0, visited = 0;
     await slices(w, () => {
       if (count >= maxView) return true;
       let next = viewportDone ? cursor.next() : viewport.next();
@@ -4399,8 +4640,10 @@ function start() {
         next = cursor.next();
       }
       if (next.done) return true;
+      if (viewportDone && visited++ >= maxView) return true;
       const el = next.value;
       if (!el || w.sampled.has(el) || own(el) || (el.parentElement && !followable(el.parentElement))) return false;
+      if (el !== root && el !== document.body && !nearViewport(el) && rootStyle(el)?.display !== 'contents') return false;
       const shadow = safe(() => el.shadowRoot, null);
       if (shadow) watchShadow(w, shadow);
       w.sampled.add(el);
@@ -4408,7 +4651,7 @@ function start() {
       const record = sample(el, w, true);
       if (record) w.view.push(record);
       return false;
-    }, null, task => measureWithoutZoom(() => sampleOriginal(w, task)));
+    }, null, task => measureWithoutZoom(() => sampleOriginal(w, task)), true);
     if (!live(w)) return;
     const analysis = analyze(w);
     w.theme = null;
@@ -4429,9 +4672,9 @@ function start() {
     });
     const resume = async stored => {
       if (stored.varRoles.length) await discoverDefinitions(w);
-      await finish(w, cursor, stored, stored.kind, stored.mode, { entry: stored });
+      await finish(w, stored, stored.kind, stored.mode, { entry: stored });
     };
-    const local = aiFailedAt => finish(w, cursor, {}, 'auto', analysis.mode, { aiFailedAt });
+    const local = aiFailedAt => finish(w, {}, 'auto', analysis.mode, { aiFailedAt });
     const reuseOrApplyLocal = async (action, entry, state) => {
       if (aiAllowed && state?.lastError) lastError = scrubDiagnosticText(state.lastError, apiKey);
       if (action === 'cache') await resume(entry);
@@ -4474,7 +4717,7 @@ function start() {
         }
         if (!currentGeneration(w)) return true;
         if (report.result) {
-          await finish(w, cursor, report.result, 'ai', report.result.mode);
+          await finish(w, report.result, 'ai', report.result.mode);
           if (w.finished && live(w)) outcome = 'ai-applied';
         } else {
           const failedAt = Date.now();
@@ -4569,9 +4812,9 @@ function start() {
       }
     };
     const w = {
-      force, manual, controller: new AbortController(), observers: new Map(), queued: new Map(), variables: new Map(),
+      force, manual, controller: new AbortController(), observers: new Map(), queued: new Map(), variables: new Map(), background: [],
       groups: new Map(), votes: new WeakMap(), sampled: new WeakSet(), view: [], finished: false,
-      mutations: Core.mutationBuffer(maxPendingChanges), contrastCandidates: new Set(), contrastDirty: new Set(),
+      mutations: Core.mutationBuffer(maxPendingChanges), contrastCandidates: new Set(), contrastDirty: new Set(), nativeInk: new WeakMap(),
       cacheGeneration: read(clearKey, null), hostGeneration: read(hostClearKey, null),
     };
     run = w;
@@ -4593,7 +4836,13 @@ function start() {
         if (!live(w)) return;
         lastError = '读取网页配色时遇到错误。';
         cancelRun('inspection-failed');
-        setStatus(paintedMode ? status : 'off');
+        if (status === 'ai-pending') {
+          // An aborted cold commit must not leave partial paint or a pending
+          // indicator with no request capable of completing it.
+          clearPaint();
+          setCurrentHealth(null);
+          setStatus('off');
+        } else setStatus(paintedMode ? status : 'off');
       }
     };
     if (document.readyState === 'loading') {
