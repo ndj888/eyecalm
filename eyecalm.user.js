@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EyeCalm 静眸 · AI 护眼
 // @namespace    https://github.com/eyecalm/userscript
-// @version      0.4.4
+// @version      0.4.5
 // @description  按网站原有明暗切换纸张配色，可用 AI 在后台适配复杂页面。
 // @homepageURL  https://github.com/ndj888/eyecalm
 // @supportURL   https://github.com/ndj888/eyecalm/issues
@@ -1648,6 +1648,15 @@
     };
   }
 
+  // Nodes other extensions inject that only inherit page colours, such as
+  // LinguaFerry's <lf-tr> translations and its <lf-ui> controls. Sampling or
+  // observing them changes nothing visible but costs a pass per insertion,
+  // which stalls pages where hundreds of translations arrive at once.
+  const FOREIGN_OVERLAY_TAGS = new Set(['lf-tr', 'lf-ui']);
+  function foreignOverlay(el) {
+    return FOREIGN_OVERLAY_TAGS.has(el?.localName);
+  }
+
   const Core = {
     PALETTES, parseColor, normalizeColor, hsl, luminance, contrast, classifyColor, resolveColorRole, complexity, shouldUseAI,
     paletteForDepth, textContrastTarget, visibleContrast, repairContrast, validateContrastFixes,
@@ -1658,7 +1667,7 @@
     normalizeFontScale, normalizeSitePreferences, resolveTextDepth, normalizeRestInterval, adjustFontScale,
     localDay, shouldSuggestScale, restState, reduceRest, restPromptDecision, restSyncEffect, fontScaleSource,
     detectTheme, maskBackground, accentBackground, migrateSettings, activeHostLock, claimHostLease,
-    liveDOMSize, mutationBuffer, watchHistory,
+    liveDOMSize, mutationBuffer, watchHistory, foreignOverlay,
   };
 
 const Panel = {
@@ -2935,7 +2944,7 @@ function start() {
   }
 
   function own(el) {
-    return el.hasAttribute('data-ec-ui') || el.hasAttribute('data-ec-style');
+    return el.hasAttribute('data-ec-ui') || el.hasAttribute('data-ec-style') || Core.foreignOverlay(el);
   }
 
   function protectedMedia(el) {
