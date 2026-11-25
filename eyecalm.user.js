@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EyeCalm 静眸 · AI 护眼
 // @namespace    https://github.com/eyecalm/userscript
-// @version      0.5.0
+// @version      0.6.0
 // @description  按网站原有明暗切换纸张配色，可用 AI 在后台适配复杂页面。
 // @homepageURL  https://github.com/ndj888/eyecalm
 // @supportURL   https://github.com/ndj888/eyecalm/issues
@@ -1877,6 +1877,8 @@
     liveDOMSize, mutationBuffer, watchHistory, foreignOverlay,
   };
 
+const TOUCH_LAYOUT = '(max-width: 600px), (pointer: coarse), (any-pointer: coarse)';
+
 const Panel = {
   init(actions) {
     const host = document.createElement('div');
@@ -1965,6 +1967,35 @@ const Panel = {
         }
       }
       @media (max-width: 390px) { fieldset { grid-template-columns: 1fr; } }
+      @media ${TOUCH_LAYOUT} {
+        :host {
+          --ec-top: max(12px, env(safe-area-inset-top, 0px));
+          --ec-right: max(12px, env(safe-area-inset-right, 0px));
+          --ec-bottom: max(12px, env(safe-area-inset-bottom, 0px));
+          --ec-left: max(12px, env(safe-area-inset-left, 0px));
+        }
+        .float {
+          right: calc(var(--ec-right) + 4px); bottom: calc(var(--ec-bottom) + 4px);
+          width: 44px; height: 44px; opacity: 1; font-size: 16px;
+        }
+        dialog {
+          position: fixed; inset: var(--ec-top) var(--ec-right) var(--ec-bottom) var(--ec-left); margin: auto;
+          width: min(520px, calc(100% - var(--ec-left) - var(--ec-right)));
+          max-height: calc(100vh - var(--ec-top) - var(--ec-bottom));
+          max-height: calc(100dvh - var(--ec-top) - var(--ec-bottom));
+          overscroll-behavior: contain;
+        }
+        form { padding: 12px; }
+        button, label, input:not([type=checkbox]), select, summary { min-height: 44px; }
+        button { min-width: 44px; }
+        label { justify-content: center; }
+        label.check { justify-content: start; }
+        input:not([type=checkbox]), select, textarea { font-size: 16px; }
+        summary { padding-block: 11px; }
+        .notices { inset: auto var(--ec-right) calc(var(--ec-bottom) + 56px) auto;
+          width: min(330px, calc(100vw - var(--ec-left) - var(--ec-right))); }
+        dialog .notices { inset: auto 0 0; width: auto; padding-inline: 12px; }
+      }
     `;
     try {
       const sheet = new CSSStyleSheet();
@@ -2025,13 +2056,15 @@ const Panel = {
     const diagnosticCopy = element('textarea', { className: 'diag-copy', readOnly: true, hidden: true, ariaLabel: '最近 AI 诊断 JSON' });
     const save = button('保存', null, 'primary');
     const test = button('测试连接', testConnection);
-    const currentScale = element('p', { className: 'quiet full' });
+    const currentScale = statusLine('quiet full');
     const suggestedScale = element('p', { className: 'quiet full' });
     const siteType = element('p', { className: 'quiet full' });
     const healthTip = element('p', { className: 'quiet full' });
     const disclaimer = element('p', { className: 'quiet full',
       textContent: '配色和提醒用于提升舒适度，不能替代验光和眼科检查；屏幕亮度建议与环境光相当，观看距离约 50–70 厘米。' });
     const applyScale = button('应用建议字号', () => actions.applyScale(actions.getState().health?.fontScale));
+    const decreaseScale = button('缩小字号', () => actions.adjustScale('decrease'));
+    const increaseScale = button('放大字号', () => actions.adjustScale('increase'));
     const clearScale = button('清除字号设置', () => actions.adjustScale('clear'));
     const notices = element('div', { className: 'notices', hidden: true });
     const noticeTimers = new Map();
@@ -2050,6 +2083,8 @@ const Panel = {
     let restSnooze = null;
     let keyChanged = false;
     let active = true;
+    let paused = false;
+    let testController, scrollLock, draftBaseline;
     let dialogGeneration = 0;
     let diagnosticCopyGeneration = 0;
     let mountObserver = null;
@@ -2090,6 +2125,9 @@ const Panel = {
 
     function closeSettings() {
       dialogGeneration++;
+      cancelTest();
+      scrollLock?.remove();
+      scrollLock = null;
       if (dialog.open) {
         dialog.close();
         shadow.append(notices);
@@ -2097,26 +2135,44 @@ const Panel = {
       }
       key.value = '';
       keyChanged = false;
+      draftBaseline = null;
       hideDiagnosticCopy();
+    }
+
+    function syncDraft(state) {
+      const opening = !draftBaseline;
+      draftBaseline ??= new Map();
+      function sync(control, property, value) {
+        if (!opening && control[property] !== draftBaseline.get(control)) return;
+        if (control[property] !== value) control[property] = value;
+        draftBaseline.set(control, control[property]);
+      }
+      for (const [name, control] of Object.entries(controls)) {
+        if (control.type === 'checkbox') sync(control, 'checked', state.settings[name]);
+        else sync(control, 'value', String(state.settings[name] ?? ''));
+      }
+      sync(site, 'value', state.site);
+      sync(siteDepth, 'value', state.sitePreferences.textDepth);
+      if (!keyChanged) key.placeholder = state.keyStatus === 'loading' ? '正在读取…' : state.keyStatus === 'failed' ? '读取失败' :
+        state.apiKeySuffix ? `已保存 ••••${state.apiKeySuffix}` : '未设置';
     }
 
     function openSettings() {
       if (!active || dialog.open) return;
-      const state = actions.getState();
-      for (const [name, control] of Object.entries(controls)) {
-        if (control.type === 'checkbox') control.checked = state.settings[name];
-        else control.value = state.settings[name] ?? '';
-      }
-      site.value = state.site;
-      siteDepth.value = state.sitePreferences.textDepth;
       key.value = '';
-      key.placeholder = state.apiKeySuffix ? `已保存 ••••${state.apiKeySuffix}` : '未设置';
       keyChanged = false;
+      syncDraft(actions.getState());
       actionStatus.textContent = '';
       hideNotice(scaleHint);
       dialog.append(notices);
       dialog.showModal();
+      scrollLock = element('style');
+      scrollLock.setAttribute('data-ec-ui', '');
+      scrollLock.textContent = `@media ${TOUCH_LAYOUT}{html:root,html:root>body{overflow:hidden!important;overscroll-behavior:none!important}}`;
+      document.documentElement.append(scrollLock);
       update();
+      actions.loadCacheStats?.();
+      actions.loadApiKey?.();
     }
 
     function getDraft() {
@@ -2141,18 +2197,25 @@ const Panel = {
       actionStatus.textContent = text;
     }
 
+    function cancelTest() {
+      testController?.abort();
+      testController = null;
+      test.disabled = paused;
+    }
+
     async function testConnection() {
-      if (!form.reportValidity()) return;
+      if (paused || testController || !form.reportValidity()) return;
       const generation = dialogGeneration;
+      const controller = testController = new AbortController();
       test.disabled = true;
       showAction('正在测试连接…');
       try {
-        const message = await actions.testConnection(getDraft());
-        if (generation === dialogGeneration) showAction(message || '连接成功');
+        const message = await actions.testConnection(getDraft(), controller.signal);
+        if (generation === dialogGeneration && !controller.signal.aborted) showAction(message || '连接成功');
       } catch (error) {
-        if (generation === dialogGeneration) showAction(error.message || '连接测试失败', true);
+        if (generation === dialogGeneration && !controller.signal.aborted) showAction(error.message || '连接测试失败', true);
       } finally {
-        test.disabled = false;
+        if (testController === controller) cancelTest();
       }
     }
 
@@ -2167,8 +2230,13 @@ const Panel = {
     }
 
     async function copyDiagnostics() {
-      const text = JSON.stringify(actions.diagnostics(), null, 2);
       const generation = ++diagnosticCopyGeneration;
+      if (actions.loadDiagnostics && !await actions.loadDiagnostics()) {
+        if (generation === diagnosticCopyGeneration) showAction('未能读取诊断记录。', true);
+        return;
+      }
+      if (generation !== diagnosticCopyGeneration) return;
+      const text = JSON.stringify(actions.diagnostics(), null, 2);
       try {
         await navigator.clipboard.writeText(text);
         if (generation !== diagnosticCopyGeneration) return;
@@ -2190,7 +2258,9 @@ const Panel = {
       const reasons = { configuration: '配置错误', network: '连接失败', timeout: '超时', cancelled: '已取消',
         'theme-changed': '网站主题已切换', superseded: '适配任务已替换', 'lease-lost': '适配锁已移交', 'cache-cleared': '缓存已清除',
         response: '响应无效', http: '接口错误', truncated: '回复不完整', 'invalid-json': 'JSON 无效', empty: '没有可用规则' };
-      const records = actions.diagnostics().slice(-10).reverse();
+      const read = actions.diagnostics();
+      emptyDiagnostics.textContent = read == null ? (actions.diagnosticsStatus() === 'failed' ? '未能读取诊断记录。' : '正在读取诊断记录…') : '暂无 AI 诊断记录。';
+      const records = (read ?? []).slice(-10).reverse();
       const rows = records.map(record => {
         const timestamp = new Date(record.time);
         const time = timestamp.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
@@ -2264,13 +2334,14 @@ const Panel = {
     }
 
     function displayNotice(node, duration) {
+      if (paused || !active) return;
       clearTimeout(noticeTimers.get(node));
       node.hidden = notices.hidden = false;
       noticeTimers.set(node, setTimeout(() => hideNotice(node), duration));
     }
 
     function showScaleHint(scale, manual = false) {
-      if (!active || dialog.open || !restNotice.hidden || !actions.getState().hasScaleSuggestion) return;
+      if (paused || !active || dialog.open || !restNotice.hidden || !actions.getState().hasScaleSuggestion) return;
       scaleHintValue = scale;
       manualScaleHint = manual;
       scaleHintText.textContent = `建议将此网站字号调至 ${scalePercent(scale)}。`;
@@ -2291,17 +2362,19 @@ const Panel = {
     }));
     restNotice.append(restText, restActions);
     notices.append(...noticeNodes);
-    scaleActions.append(applyScale, clearScale);
+    scaleActions.append(decreaseScale, increaseScale, clearScale, applyScale);
 
     function update() {
       const state = actions.getState();
+      if (dialog.open) syncDraft(state);
       const { fontScale } = state.sitePreferences;
       const health = state.health;
       host.style.setProperty('--ec-ui-zoom', String(1 / (fontScale ?? 1)));
       for (const role of ['surface', 'fill', 'bg', 'text', 'border']) {
         restNotice.style.setProperty(`--ec-rest-${role}`, state.restPalette?.[role] ?? '');
       }
-      currentScale.textContent = `当前字号 ${scalePercent(fontScale)}${fontScale === null ? '（默认）' : ''}`;
+      const scaleText = `当前字号 ${scalePercent(fontScale)}${fontScale === null ? '（默认）' : ''}`;
+      if (currentScale.textContent !== scaleText) currentScale.textContent = scaleText;
       const source = state.healthScaleSource === 'ai' ? 'AI' : '本地';
       suggestedScale.textContent = health ? `建议字号 ${scalePercent(health.fontScale)}（${source}）` : '暂无字号建议';
       applyScale.disabled = !health || !normalizeFontScale(health.fontScale) || health.fontScale === fontScale || state.conflict;
@@ -2322,11 +2395,11 @@ const Panel = {
       floating.classList.toggle('pending', state.pending);
       const statusText = { off: '已关闭', auto: '本地适配', ai: 'AI 适配', 'ai-pending': 'AI 适配中', cached: '已使用缓存' };
       siteStatus.textContent = state.conflict ? '此网站由其他脚本处理' :
-        (statusText[state.status] || (state.enabled ? '已开启' : '已关闭')) +
+        (state.enabled && state.suspended ? '已暂停（页面不可见）' : statusText[state.status] || (state.enabled ? '已开启' : '已关闭')) +
         (state.pending && state.status !== 'ai-pending' ? ' · 正在重新适配' : '');
       lastError.textContent = state.lastError ? `上次 AI 错误：${state.lastError}` : '';
       lastError.hidden = !state.lastError;
-      cacheStatus.textContent = `已缓存 ${state.cacheCount} 个网站，占用 ${formatBytes(state.cacheBytes)}`;
+      cacheStatus.textContent = state.cacheMessage ?? `已缓存 ${state.cacheCount} 个网站，占用 ${formatBytes(state.cacheBytes)}`;
       if (dialog.open && diagnosticSection.open) updateDiagnostics();
       const shortError = state.lastError?.replace(/\s+/g, ' ').slice(0, 64);
       const refreshLabel = '用 AI 重新适配此网站' + (shortError ? `（上次：${shortError}）` : '');
@@ -2356,7 +2429,9 @@ const Panel = {
       event.preventDefault();
       closeSettings();
     });
-    header.append(title, button('关闭', closeSettings));
+    const close = button('关闭', closeSettings);
+    close.setAttribute('autofocus', '');
+    header.append(title, close);
     const apiActions = element('div', { className: 'actions full' });
     apiActions.append(test, clearKey);
     const cacheActions = element('div', { className: 'actions full' });
@@ -2364,13 +2439,19 @@ const Panel = {
     const diagnosticActions = element('div', { className: 'actions' });
     const copy = button('复制诊断信息', copyDiagnostics);
     copy.title = '复制最近 50 条诊断记录（JSON）';
-    diagnosticActions.append(copy, button('清空', () => {
-      actions.clearDiagnostics();
+    diagnosticActions.append(copy, button('清空', async () => {
+      const generation = dialogGeneration;
+      const result = actions.clearDiagnostics();
+      const cleared = result && typeof result.then === 'function' ? await result : result;
+      if (generation !== dialogGeneration) return;
+      if (cleared === false) return showAction('未能清除诊断记录。', true);
       hideDiagnosticCopy();
       showAction('已清除 AI 诊断记录。');
     }));
     diagnosticSection.append(element('summary', { textContent: '诊断日志' }), emptyDiagnostics, diagnosticList, diagnosticActions, diagnosticCopy);
-    diagnosticSection.addEventListener('toggle', () => { if (dialog.open && diagnosticSection.open) updateDiagnostics(); });
+    diagnosticSection.addEventListener('toggle', () => {
+      if (dialog.open && diagnosticSection.open) { updateDiagnostics(); actions.loadDiagnostics?.(); }
+    });
     const footer = element('footer');
     save.type = 'submit';
     footer.append(button('取消', closeSettings), save);
@@ -2384,14 +2465,24 @@ const Panel = {
         field('API 类型', controls.apiType), field('模型', controls.model), field('推理强度', controls.reasoningEffort),
         field('请求优先处理', controls.serviceTier, 'check'), apiActions),
       actionStatus, lastError, group('缓存', cacheStatus, cacheActions), diagnosticSection, disclaimer, footer);
-    form.addEventListener('submit', event => {
+    let saving = false;
+    form.addEventListener('submit', async event => {
       event.preventDefault();
+      if (saving) return;
+      const generation = dialogGeneration;
       try {
-        actions.setSettings(getDraft());
-        closeSettings();
+        const draft = getDraft();
+        if (draft.apiKey !== undefined && actions.loadApiKey) {
+          saving = true;
+          const ready = await actions.loadApiKey();
+          if (generation !== dialogGeneration || paused) return;
+          if (!ready) throw new Error('未能读取 API 密钥；请刷新后重试。');
+        }
+        actions.setSettings(draft);
+        if (generation === dialogGeneration) closeSettings();
       } catch (error) {
-        showAction(error.message || '保存失败', true);
-      }
+        if (generation === dialogGeneration) showAction(error.message || '保存失败', true);
+      } finally { saving = false; }
     });
     dialog.append(form);
     shadow.append(floating, dialog, notices);
@@ -2410,8 +2501,15 @@ const Panel = {
     update();
     return {
       update,
+      setPaused(value) {
+        paused = value;
+        if (paused && testController) showAction('页面暂停，已取消连接测试。');
+        cancelTest();
+        if (paused) for (const node of noticeNodes) hideNotice(node);
+      },
       showScaleHint,
       showScaleFeedback(scale) {
+        if (dialog.open) return;
         hideNotice(scaleHint);
         scaleFeedback.textContent = scalePercent(scale);
         displayNotice(scaleFeedback, 1500);
@@ -2654,6 +2752,7 @@ function start() {
     'hidden', 'open', 'value', 'data-testid', 'data-theme', 'data-color-mode', 'data-mode', 'data-bs-theme'];
   let cachedContrast, paintedPalette, paintedDepth, canvasProbe, contrastRevision = 0;
   let settings, apiKey, site, sitePreferences, canReadGMSettings, profile, panel, pending = false, lastError = '';
+  let cacheClearError = '';
   let healthRecommendation = null;
   let healthScaleSource = 'local';
   let root = document.documentElement;
@@ -2663,10 +2762,21 @@ function start() {
   let themeCheckTimer, themeConfirmTimer, themeCandidate;
   const fixture = safe(() => GM_getValue.eyecalmFixture === true, false);
   const darkPreference = safe(() => matchMedia('(prefers-color-scheme: dark)'), null);
+  const touchLayout = safe(() => matchMedia(TOUCH_LAYOUT), null);
+  // package-extension puts the adapter and this callback in the same lexical
+  // scope. Neither its GM shims nor gmRuntime are window properties.
+  const packaged = typeof startEyeCalm === 'function' && typeof gmRuntime !== 'undefined';
+  const phasedStorage = packaged && typeof gmLoadKey === 'function' && typeof gmCacheOperation === 'function';
+  const storageWritable = () => !phasedStorage || gmCanPersist();
+  const mobileExtension = () => packaged && !!touchLayout?.matches;
+  const visibilityPaused = () => mobileExtension() &&
+    (document.hidden || (document.visibilityState != null && document.visibilityState !== 'visible'));
+  const cancellableIdle = typeof requestIdleCallback === 'function' && typeof cancelIdleCallback === 'function';
   const storedMode = read(lastModeKey, null);
   let selectedMode = MODES.includes(storedMode) ? storedMode : darkPreference?.matches ? 'dark' : 'light';
   const pageId = safe(() => crypto.randomUUID(), `${Date.now()}-${Math.random()}`);
-  let activeLease, suspended = false, resumeTimer;
+  let pageHidden = false, unloading = false, suspended = visibilityPaused();
+  let resumeTimer, unloadTimer, suspendedPreferences, competing;
 
   function read(key, fallback, local = false) {
     const value = safe(() => GM_getValue(key, undefined));
@@ -2721,18 +2831,27 @@ function start() {
     const migrated = Core.migrateSettings(savedSettings);
     if (migrated !== savedSettings) {
       if (canReadGMSettings) write(settingsKey, migrated, true);
-      else safe(() => localStorage.setItem(settingsKey, JSON.stringify(migrated)));
+      else if (storageWritable()) safe(() => localStorage.setItem(settingsKey, JSON.stringify(migrated)));
     }
     settings = normalizeSettings(migrated);
-    apiKey = read(secretKey, '');
-    if (typeof apiKey !== 'string') apiKey = '';
+    loadStoredKey();
     const saved = read(siteKey, 'inherit', true);
     site = ['on', 'off'].includes(saved) ? saved : 'inherit';
     sitePreferences = normalizeSitePreferences(read(sitePrefsKey, null, true));
   }
 
   loadSettings();
-  migrateProfile();
+  function loadStoredKey() {
+    apiKey = read(secretKey, '');
+    if (typeof apiKey !== 'string') apiKey = '';
+  }
+
+  async function loadApiKey() {
+    const ready = await gmLoadKey(secretKey);
+    if (!stopped) { loadStoredKey(); panel?.update(); }
+    return ready;
+  }
+  if (!phasedStorage) migrateProfile();
 
   // Site-specific scripts under sites/ mark <html> while their eye-care mode is on.
   const YIELD_CLASSES = ['zc-eyecare', 'ld-eyecare'];
@@ -2741,8 +2860,12 @@ function start() {
     return !!root && YIELD_CLASSES.some(name => root.classList.contains(name));
   }
 
+  function siteEnabled() {
+    return !conflict() && (site === 'on' || (site !== 'off' && settings.enabled));
+  }
+
   function enabled() {
-    return !stopped && !suspended && !conflict() && (site === 'on' || (site !== 'off' && settings.enabled));
+    return !stopped && !suspended && !visibilityPaused() && siteEnabled();
   }
 
   function effectiveTextDepth(health = currentHealth()) {
@@ -2775,7 +2898,7 @@ function start() {
     const beforeScale = sitePreferences.fontScale;
     sitePreferences = { ...latest, ...changes };
     if (Object.keys(changes).some(key => latest[key] !== changes[key])) write(sitePrefsKey, sitePreferences, true);
-    if (sitePreferences.fontScale !== beforeScale) {
+    if (!suspended && !visibilityPaused() && sitePreferences.fontScale !== beforeScale) {
       applyZoom();
       refreshContrast();
     }
@@ -2795,12 +2918,13 @@ function start() {
   function scheduleScaleHint() {
     stopScaleHint();
     const scale = currentHealth()?.fontScale;
-    if (stopped || !panel || !settings.showButton || conflict() || !shouldSuggestScale(sitePreferences, scale, localDay(Date.now()))) return;
+    if (stopped || suspended || visibilityPaused() || !panel || !settings.showButton || conflict() ||
+        !shouldSuggestScale(sitePreferences, scale, localDay(Date.now()))) return;
     scaleHintTimer = setTimeout(() => {
       const day = localDay(Date.now());
       const preferences = normalizeSitePreferences(read(sitePrefsKey, null, true));
       const scale = currentHealth()?.fontScale;
-      if (conflict() || !shouldSuggestScale(preferences, scale, day)) return;
+      if (suspended || visibilityPaused() || conflict() || !shouldSuggestScale(preferences, scale, day)) return;
       if (document.visibilityState !== 'visible' || !document.hasFocus()) {
         window.addEventListener('focus', scheduleScaleHint);
         document.addEventListener('visibilitychange', scheduleScaleHint);
@@ -2831,7 +2955,12 @@ function start() {
 
   function syncRest() {
     restCleanup?.();
-    restCleanup = settings.restEnabled && panel ? watchRest({
+    restCleanup = null;
+    if (phasedStorage && !suspended && !visibilityPaused() && settings.restEnabled && panel && gmKeyState(restKey) !== 'ready') {
+      if (gmKeyState(restKey) === 'loading') gmLoadKey(restKey).then(ready => { if (ready && !stopped && !restCleanup) syncRest(); });
+      return;
+    }
+    restCleanup = !suspended && !visibilityPaused() && settings.restEnabled && panel ? watchRest({
       read: () => read(restKey, null, true), write: state => write(restKey, state, true),
       subscribe: callback => listen(restKey, callback),
       minutes: settings.restInterval, fixture, editing: isEditing,
@@ -2964,13 +3093,19 @@ function start() {
   }
 
   function diagnostics() {
+    if (phasedStorage && gmKeyState(diagnosticsKey) !== 'ready') return null;
     return Core.recentAIRecords(read(diagnosticsKey, []));
   }
 
   function recordAIReport(config, trigger, report, outcome, dropReason) {
     const record = Core.makeAIRecord(hostname, config, trigger, report, outcome, Date.now(), dropReason);
-    write(diagnosticsKey, Core.recentAIRecords(diagnostics(), record));
-    if (!stopped) panel?.update();
+    const append = () => {
+      if (phasedStorage && (stopped || suspended || visibilityPaused())) return;
+      write(diagnosticsKey, Core.recentAIRecords(diagnostics(), record));
+      if (!stopped) panel?.update();
+    };
+    if (phasedStorage && gmKeyState(diagnosticsKey) !== 'ready') gmLoadKey(diagnosticsKey).then(ready => { if (ready) append(); });
+    else append();
   }
 
   function currentHealth() {
@@ -3000,15 +3135,20 @@ function start() {
     return value && typeof value === 'object' && !Array.isArray(value) ? { ...value } : {};
   }
 
+  function savedProfile(mode) {
+    const entry = read(profileKeyFor(mode), null);
+    if (!phasedStorage || (entry?.mode === mode && Core.cacheState(entry).usable)) return entry;
+    const legacy = read(legacyProfileKey, null);
+    return legacy?.mode === mode && Core.cacheState(legacy).usable ? legacy : entry;
+  }
+
   function migrateProfile() {
     const legacy = read(legacyProfileKey, null);
     if (!Core.cacheState(legacy).usable) return;
     const key = profileKeyFor(legacy.mode);
     const existing = read(key, null);
-    if (!existing && !write(key, legacy)) return;
-    if (existing && (existing.mode !== legacy.mode || !Core.cacheState(existing).usable)) {
-      if (!write(key, legacy)) return;
-    }
+    const copy = !existing || existing.mode !== legacy.mode || !Core.cacheState(existing).usable;
+    if (copy && !write(key, legacy)) return;
     const index = cacheIndex();
     delete index[legacyProfileKey];
     const entry = read(key, legacy);
@@ -3017,7 +3157,26 @@ function start() {
     remove(legacyProfileKey);
   }
 
+  let migratingProfile = false;
+  async function migrateWhenReady() {
+    if (!phasedStorage || migratingProfile || !enabled() || !run) return;
+    const entry = read(legacyProfileKey, null);
+    if (!Core.cacheState(entry).usable) return;
+    const expectedTarget = read(profileKeyFor(entry.mode), null);
+    migratingProfile = true;
+    try {
+      await gmCacheOperation({ type: 'migrate', entry, mode: entry.mode, expectedTarget,
+        keepExisting: expectedTarget?.mode === entry.mode && Core.cacheState(expectedTarget).usable, generation: read(clearKey, null),
+        hostGeneration: read(hostClearKey, null) }, run.controller.signal);
+    } finally { migratingProfile = false; }
+  }
+
   function cacheStats() {
+    if (cacheClearError) return { cacheMessage: cacheClearError };
+    if (phasedStorage && gmKeyState(indexKey) !== 'ready') {
+      return { cacheMessage: gmKeyState(indexKey) === 'loading' ? '正在读取缓存信息…' :
+        '未能读取完整缓存，暂无法管理缓存；请刷新重试。' };
+    }
     const index = cacheIndex();
     const profileKey = profileKeyFor(selectedMode);
     if (!index[profileKey] && cacheIsUsable(profile)) {
@@ -3036,16 +3195,20 @@ function start() {
       (!w.ownsLease || w.ownsLease());
   }
 
-  function putProfile(entry, w) {
+  function putProfile(entry, w, clearRetry = false) {
     if (!live(w) || entry.mode !== w.mode || !currentGeneration(w)) return;
     const profileKey = profileKeyFor(w.mode);
     const bytes = encoder.encode(JSON.stringify(entry)).byteLength;
     if (bytes > cacheLimit) return;
     profile = entry;
+    if (phasedStorage) return maintainProfile(w, { type: 'commit', entry, clearRetry }).then(saved => {
+      if (saved) w.cachedSource = entry;
+      return saved;
+    });
     write(profileKey, entry);
     const trim = () => {
       const current = read(profileKey, null);
-      if (!currentGeneration(w) || !current) return;
+      if (!live(w) || !currentGeneration(w) || !current) return;
       const index = cacheIndex();
       index[profileKey] = { bytes: encoder.encode(JSON.stringify(current)).byteLength, lastUsed: current.lastUsed };
       for (const key of profileKeys()) {
@@ -3058,9 +3221,36 @@ function start() {
       write(indexKey, kept);
       panel?.update();
     };
-    if (navigator.locks?.request) {
-      navigator.locks.request('eyecalm-cache-index', trim).catch(() => {});
-    } else trim();
+    const trimUnderLock = () => {
+      if (typeof navigator.locks?.request === 'function') {
+        const signal = w.controller.signal;
+        Promise.resolve().then(() => live(w) && navigator.locks.request('eyecalm-cache-index', { signal }, trim))
+          .catch(() => { if (live(w)) trim(); });
+      } else trim();
+    };
+    trimUnderLock();
+  }
+
+  function maintainProfile(w, command) {
+    if (!live(w) || !currentGeneration(w)) return Promise.resolve(false);
+    return gmCacheOperation({ ...command, mode: w.mode, leaseToken: w.leaseToken,
+      generation: w.cacheGeneration, hostGeneration: w.hostGeneration }, w.controller.signal);
+  }
+
+  function recompileCachedProfile(w, derive) {
+    // Serialize derived updates from this run. A remote profile cannot become
+    // their source just because its storage change updated the panel cache.
+    const work = (w.cacheMaintenance ?? Promise.resolve()).then(async () => {
+      const expected = w.cachedSource;
+      if (!expected || !live(w)) return false;
+      const entry = derive(expected);
+      if (!entry) return false;
+      const saved = await maintainProfile(w, { type: 'recompile', entry, expected });
+      if (saved) w.cachedSource = entry;
+      return saved;
+    });
+    w.cacheMaintenance = work;
+    return work;
   }
 
   function rootStyle(element) {
@@ -3717,13 +3907,40 @@ function start() {
     return run === w && !w.controller.signal.aborted && enabled();
   }
 
+  function waitForRun(w, delay) {
+    return new Promise(resolve => {
+      if (!live(w)) { resolve(false); return; }
+      const signal = w.controller.signal;
+      const timer = setTimeout(() => {
+        signal.removeEventListener('abort', abort);
+        resolve(live(w));
+      }, delay);
+      const abort = () => { clearTimeout(timer); resolve(false); };
+      signal.addEventListener('abort', abort, { once: true });
+    });
+  }
+
   function slices(w, step, flush, original = true, foreground = false) {
     return new Promise((resolve, reject) => {
-      const schedule = callback => !foreground && typeof requestIdleCallback === 'function'
-        ? requestIdleCallback(callback, { timeout: 60 }) : setTimeout(() => callback(null), 0);
+      if (!live(w)) { resolve(false); return; }
+      const signal = w.controller.signal;
+      const useIdle = !foreground && cancellableIdle;
+      let handle;
+      const schedule = () => {
+        handle = useIdle ? requestIdleCallback(batch, { timeout: 60 }) : setTimeout(() => batch(null), 0);
+      };
+      const finish = (settle, value) => {
+        signal.removeEventListener('abort', abort);
+        settle(value);
+      };
+      const abort = () => {
+        if (handle != null) safe(() => useIdle ? cancelIdleCallback(handle) : clearTimeout(handle));
+        finish(resolve, false);
+      };
       let done = false, unwritten = false;
       function batch(deadline) {
-        if (!live(w)) { resolve(false); return; }
+        handle = null;
+        if (!live(w)) { finish(resolve, false); return; }
         const start = performance.now();
         try {
           if (!done && !unwritten) {
@@ -3743,11 +3960,12 @@ function start() {
             done = original === true ? withoutPaint(advance) : original ? original(advance) : advance();
           }
           unwritten = flush?.(start + 7.5) === false;
-          if (done && !unwritten) resolve(true);
-          else schedule(batch);
-        } catch (error) { reject(error); }
+          if (!live(w) || (done && !unwritten)) finish(resolve, live(w));
+          else schedule();
+        } catch (error) { finish(reject, error); }
       }
-      schedule(batch);
+      signal.addEventListener('abort', abort, { once: true });
+      try { schedule(); } catch (error) { finish(reject, error); }
     });
   }
 
@@ -4083,9 +4301,11 @@ function start() {
   }
 
   function probeShadows(w) {
+    if (!live(w) || mobileExtension() || w.probe != null || w.probeIdle != null) return;
     let iterator, large;
     function probe() {
-      if (!live(w)) return;
+      w.probeIdle = null;
+      if (!live(w) || mobileExtension()) return;
       if (!document.hidden) {
         const oversized = Core.liveDOMSize(document) > maxNodes;
         if (oversized !== large) { large = oversized; iterator = null; }
@@ -4099,11 +4319,18 @@ function start() {
       w.probe = setTimeout(schedule, iterator ? 750 : 2500);
     }
     function schedule() {
-      if (!live(w)) return;
-      if (typeof requestIdleCallback === 'function') w.probeIdle = requestIdleCallback(probe, { timeout: 1000 });
+      w.probe = null;
+      if (!live(w) || mobileExtension()) return;
+      if (cancellableIdle) w.probeIdle = requestIdleCallback(probe, { timeout: 1000 });
       else probe();
     }
     w.probe = setTimeout(schedule, 1200);
+  }
+
+  function stopShadowProbe(w) {
+    clearTimeout(w.probe);
+    if (w.probeIdle != null) safe(() => cancelIdleCallback(w.probeIdle));
+    w.probe = w.probeIdle = null;
   }
 
   function queueRoot(w, el, added = false) {
@@ -4204,6 +4431,30 @@ function start() {
     yield* w.contrastCandidates;
     yield* contrastRows.keys();
     for (const scope of w.observers.keys()) if (scope.host) yield scope.host;
+  }
+
+  function* pruneAfterPause(w) {
+    // No mutation records exist for the hidden interval. Release old detached
+    // paint/shadow references a slice at a time, without replaying hidden churn.
+    let seen = 0;
+    const candidates = function* () {
+      for (const scope of shadows.keys()) yield scope.host;
+      yield* marked;
+      yield* masks;
+    };
+    for (const el of candidates()) {
+      if (seen++ >= maxNodes) break;
+      if (!el.isConnected) forgetElement(w, el);
+      yield;
+    }
+  }
+
+  function* crawlAfterPause(w) {
+    let seen = 0;
+    for (const el of elements(root, w, false, true)) {
+      if (seen++ >= maxNodes) break;
+      yield el;
+    }
   }
 
   function nearViewport(el) {
@@ -4378,9 +4629,8 @@ function start() {
     run.controller.abort();
     root?.removeAttribute('data-ec-updating');
     clearTimeout(run.retry);
-    clearTimeout(run.probe);
+    stopShadowProbe(run);
     clearTimeout(run.viewportTimer);
-    if (run.probeIdle != null) safe(() => cancelIdleCallback(run.probeIdle));
     for (const observer of run.observers.values()) observer.disconnect();
     run = null;
   }
@@ -4421,7 +4671,7 @@ function start() {
     });
   }
 
-  async function connectionPing(config) {
+  async function connectionPing(config, signal) {
     const requests = availableAIRequests(config, Core.buildSummary({}));
     if (!requests.length) throw new Error('请检查 API 地址、密钥和模型设置。');
     const started = performance.now();
@@ -4441,7 +4691,8 @@ function start() {
       const fingerprint = JSON.stringify(body);
       if (bodies.has(fingerprint)) continue;
       bodies.add(fingerprint);
-      const { status, text } = await network({ ...request, body });
+      const { status, text } = await network({ ...request, body }, signal);
+      if (signal.aborted) throw new Error(REQUEST_ERRORS.cancelled);
       if (status === 400) continue;
       if (status < 200 || status >= 300) throw new Error('AI 接口未通过连接测试。');
       const answer = Core.extractAIText(text) || text;
@@ -4457,34 +4708,52 @@ function start() {
 
   async function withHostLock(w, task) {
     const token = safe(() => crypto.randomUUID(), `${Date.now()}-${Math.random()}`);
-    const claim = () => live(w) && Core.claimHostLease({ pageId, token, read: () => read(lockKey, null),
-      write: value => write(lockKey, value), remove: () => remove(lockKey) });
-    // The Web Lock guards only the claim. A frozen document must not prevent lease takeover.
-    const lease = navigator.locks?.request ? await navigator.locks.request(`eyecalm-profile:${hostname}`,
-      { ifAvailable: true }, lock => lock ? claim() : false).catch(claim) : claim();
-    if (!lease) return null;
-    let renewal;
+    let lease, renewal, released = false;
+    const signal = w.controller.signal;
     const release = () => {
+      if (released) return;
+      released = true;
       clearInterval(renewal);
       lease.release();
-      if (activeLease === release) activeLease = null;
     };
+    const claim = async () => {
+      if (!live(w) || lease) return;
+      const fresh = phasedStorage ? await gmFreshKeys([lockKey]) : null;
+      if (!live(w) || (phasedStorage && !fresh)) return;
+      let initial = Boolean(fresh);
+      lease = Core.claimHostLease({ pageId, token, read: () => {
+        if (initial) { initial = false; return fresh[lockKey] ?? null; }
+        return read(lockKey, null);
+      },
+        write: value => write(lockKey, value), remove: () => remove(lockKey) });
+      // Register inside the Web Lock callback: the request Promise may not have returned yet.
+      if (lease) {
+        signal.addEventListener('abort', release, { once: true });
+        if (phasedStorage && !await gmBoundedWrite(lockKey, signal)) release();
+      }
+    };
+    // The Web Lock guards only the claim. A frozen document must not prevent lease takeover.
+    try {
+      if (typeof navigator.locks?.request === 'function') {
+        await navigator.locks.request(`eyecalm-profile:${hostname}`, { ifAvailable: true }, lock => lock ? claim() : undefined);
+      } else await claim();
+    } catch { await claim(); }
+    if (!lease || released) { signal.removeEventListener('abort', release); return null; }
     try {
       if (!live(w) || !lease.owns()) return null;
-      activeLease = release;
-      w.controller.signal.addEventListener('abort', release, { once: true });
-      await new Promise(resolve => setTimeout(resolve, 30 + Math.random() * 30));
-      if (!live(w) || !lease.owns()) return null;
+      if (!await waitForRun(w, 30 + Math.random() * 30) || !lease.owns()) return null;
       w.ownsLease = lease.owns;
+      w.leaseToken = token;
       renewal = setInterval(() => {
-        if (!lease.renew() && live(w)) restart({ force: w.force, manual: w.manual });
+        if (live(w) && !lease.renew()) restart({ force: w.force, manual: w.manual });
       }, LOCK_HEARTBEAT);
       const result = await task();
       if (!lease.owns() && live(w)) restart({ force: w.force, manual: w.manual });
       return result;
     } finally {
       w.ownsLease = null;
-      w.controller.signal.removeEventListener('abort', release);
+      w.leaseToken = null;
+      signal.removeEventListener('abort', release);
       release();
     }
   }
@@ -4523,12 +4792,31 @@ function start() {
     return Core.validateCachedCSS(combined) ? combined : compiled;
   }
 
-  function persistContrast(w, compiledCss = profile?.compiledCss) {
-    if (!w.mapping || !profile || profile.signature !== w.signature || profile.kind !== w.mapping.kind) return;
+  function persistContrast(w, compiledCss) {
+    const source = phasedStorage ? w.cachedSource : profile;
+    if (!w.mapping || !source || source.signature !== w.signature || source.kind !== w.mapping.kind) return;
     const contrastFixes = collectContrastFixes();
-    if (profile.compiledCss !== compiledCss || JSON.stringify(profile.contrastFixes) !== JSON.stringify(contrastFixes)) {
-      putProfile({ ...profile, compiledCss, contrastFixes }, w);
-    }
+    const derive = base => {
+      const css = compiledCss ?? base.compiledCss;
+      if (base.compiledCss !== css || JSON.stringify(base.contrastFixes) !== JSON.stringify(contrastFixes)) {
+        return { ...base, compiledCss: css, contrastFixes };
+      }
+    };
+    if (phasedStorage) return recompileCachedProfile(w, derive);
+    const entry = derive(source);
+    if (entry) putProfile(entry, w);
+  }
+
+  async function refreshCachedProfile(w, entry, contrastFixes, health, overrides) {
+    w.cachedSource = entry;
+    const access = { lastUsed: entry.lastUsed, createdAt: entry.createdAt };
+    if (Core.touchCacheEntry(access)) await maintainProfile(w, { type: 'touch', lastUsed: access.lastUsed });
+    return recompileCachedProfile(w, base => {
+      if (JSON.stringify(base.contrastFixes) !== JSON.stringify(contrastFixes) ||
+          JSON.stringify(base.health) !== JSON.stringify(health) || JSON.stringify(base.healthOverrides) !== JSON.stringify(overrides)) {
+        return { ...base, contrastFixes, health, healthOverrides: overrides };
+      }
+    });
   }
 
   async function finish(w, result, kind, mode, { entry = null, aiFailedAt } = {}) {
@@ -4544,7 +4832,8 @@ function start() {
     w.foreground = new Set(w.view.map(record => record.el));
     w.view = [];
     w.large = Core.liveDOMSize(document) > maxNodes;
-    w.startup = w.large ? null : elements(root, w, false, true);
+    w.startup = w.large ? null : w.catchUp ? crawlAfterPause(w) : elements(root, w, false, true);
+    if (w.catchUp) w.background.push(pruneAfterPause(w));
     w.rebuildCacheCSS = !entry;
     // Shared class votes are not safe for a warm load until the background
     // crawl can detect conflicting roles on another instance of the class.
@@ -4554,13 +4843,15 @@ function start() {
       w.groups.clear();
     }
     w.contrastDirty.clear();
-    w.finished = true;
     const contrastFixes = collectContrastFixes();
-    if (entry) {
+    let persistence;
+    if (entry && phasedStorage) {
+      persistence = refreshCachedProfile(w, entry, contrastFixes, health, overrides);
+    } else if (entry) {
       const touched = Core.touchCacheEntry(entry);
       if (touched || JSON.stringify(entry.contrastFixes) !== JSON.stringify(contrastFixes) ||
           JSON.stringify(entry.health) !== JSON.stringify(health) || JSON.stringify(entry.healthOverrides) !== JSON.stringify(overrides)) {
-        putProfile({ ...entry, contrastFixes, health, healthOverrides: overrides }, w);
+        persistence = putProfile({ ...entry, contrastFixes, health, healthOverrides: overrides }, w);
       }
     } else {
       const now = Date.now();
@@ -4571,11 +4862,17 @@ function start() {
       if (Number.isFinite(aiFailedAt)) saved.aiFailedAt = aiFailedAt;
       if (kind === 'ai') {
         lastError = '';
-        remove(retryKey);
+        if (!phasedStorage) remove(retryKey);
       }
-      putProfile(saved, w);
+      persistence = putProfile(saved, w, kind === 'ai');
     }
+    // Keep the host lease through a bounded durable commit. Cancellation
+    // releases it immediately and closes any not-yet-committing worker job.
+    if (phasedStorage && persistence) await persistence;
+    if (!live(w) || !currentGeneration(w)) return;
+    w.finished = true;
     setStatus(entry ? 'cached' : kind);
+    if (phasedStorage && mobileExtension()) migrateWhenReady();
     probeShadows(w);
     scheduleChanges(w);
   }
@@ -4594,6 +4891,14 @@ function start() {
     }, Math.min(24 * HOUR, Math.max(0, state.nextRetryAt - Date.now())));
   }
 
+  async function freshAIState(w, usable) {
+    const key = profileKeyFor(w.mode);
+    const latest = await gmFreshKeys([key, legacyProfileKey, retryKey, clearKey, hostClearKey, lockKey, gmCacheClearIntentKey]);
+    if (!latest || latest[gmCacheClearIntentKey] || !live(w) || (latest[clearKey] ?? null) !== w.cacheGeneration ||
+        (latest[hostClearKey] ?? null) !== w.hostGeneration || latest[lockKey]?.token !== w.leaseToken) return null;
+    return { entry: usable(latest[key]) ?? usable(latest[legacyProfileKey]), retry: aiRetryState(latest[retryKey]) };
+  }
+
   async function inspect(w) {
     if (!live(w)) return;
     observe(w, document);
@@ -4610,7 +4915,7 @@ function start() {
       document.addEventListener(type, cssStateChange, { capture: true, signal: w.controller.signal });
     }
     const viewportMoved = () => {
-      if ((!w.large && !w.geometryDirty && !w.startup) || !live(w) || w.viewportTimer != null) return;
+      if ((!mobileExtension() && !w.large && !w.geometryDirty && !w.startup) || !live(w) || w.viewportTimer != null) return;
       w.viewportTimer = setTimeout(() => {
         w.viewportTimer = null;
         if (live(w)) queueViewport(w);
@@ -4657,15 +4962,21 @@ function start() {
     w.theme = null;
     w.typographyRange = w.typographyContexts = null;
     w.localHealth = Core.localHealth(analysis.typography);
-    w.automaticAI = Core.shouldUseAI({ policy: settings.aiPolicy, hasKey: !!apiKey,
+    if (phasedStorage && (w.force || settings.aiPolicy !== 'never') && storageWritable()) {
+      await loadApiKey(); // Loading an existing key must not force a fresh run.
+      if (!live(w)) return;
+    }
+    w.automaticAI = Core.shouldUseAI({ policy: settings.aiPolicy, hasKey: storageWritable() && !!apiKey,
       complex: Core.complexity(analysis.stats).complex });
-    const forced = !!apiKey && w.force;
-    const aiAllowed = forced || w.automaticAI;
-    const cache = () => {
-      const entry = read(profileKeyFor(w.mode), null);
+    const forced = storageWritable() && !!apiKey && w.force;
+    let aiAllowed = forced || w.automaticAI;
+    if (phasedStorage && aiAllowed && !await gmLoadKey(retryKey)) aiAllowed = w.automaticAI = false;
+    if (!live(w)) return;
+    const usable = entry => {
       return cacheIsUsable(entry, w.signature, w.mode) || (w.manual && entry?.mode === w.mode && Core.cacheState(entry, w.signature).usable)
         ? entry : null;
     };
+    const cache = () => usable(savedProfile(w.mode));
     const retry = () => aiRetryState(read(retryKey, null));
     const plan = (entry, state) => Core.adaptiveAction({
       entry, retry: state, aiAllowed, force: forced, manual: w.manual, signature: w.signature,
@@ -4688,8 +4999,13 @@ function start() {
 
     setStatus(paintedMode ? status : 'ai-pending', true);
     const acquired = await withHostLock(w, async () => {
-      const newer = cache();
-      const state = retry();
+      let newer = cache(), state = retry();
+      if (phasedStorage) {
+        const latest = await freshAIState(w, usable);
+        if (!latest) return false;
+        newer = latest.entry;
+        state = latest.retry;
+      }
       const latestAction = plan(newer, state);
       if (latestAction !== 'request') {
         await reuseOrApplyLocal(latestAction, newer, state);
@@ -4737,7 +5053,9 @@ function start() {
             !w.ownsLease() ? 'lease-lost' : !currentGeneration(w) ? 'cache-cleared' : undefined);
           if (dropReason) outcome = 'dropped';
         }
-        if (!suspended && !stopped) recordAIReport(config, trigger, report, outcome, dropReason);
+        if (!suspended && !visibilityPaused() && !stopped && w.cancelReason !== 'page-suspended') {
+          recordAIReport(config, trigger, report, outcome, dropReason);
+        }
       }
       return true;
     });
@@ -4790,18 +5108,22 @@ function start() {
     return false;
   }
 
-  function restart({ force = false, manual = false, retainPaint = true, theme } = {}) {
+  function clearDisabledSite() {
+    resetThemeCandidate();
+    setCurrentHealth(null);
+    clearPaint();
+    setStatus('off');
+  }
+
+  function restart({ force = false, manual = false, retainPaint = true, theme, catchUp = false } = {}) {
     cancelRun(theme && theme.mode !== run?.mode ? 'theme-changed' : 'superseded');
     if (!root) return;
     if (!enabled()) {
-      resetThemeCandidate();
-      setCurrentHealth(null);
-      clearPaint();
-      setStatus('off');
+      if (!siteEnabled() || stopped) clearDisabledSite();
       return;
     }
     const restoreSelected = retain => {
-      profile = read(profileKeyFor(selectedMode), null);
+      profile = savedProfile(selectedMode);
       if (cacheIsUsable(profile)) restoreCache(profile);
       else {
         setCurrentHealth(null);
@@ -4812,7 +5134,7 @@ function start() {
       }
     };
     const w = {
-      force, manual, controller: new AbortController(), observers: new Map(), queued: new Map(), variables: new Map(), background: [],
+      force, manual, catchUp, controller: new AbortController(), observers: new Map(), queued: new Map(), variables: new Map(), background: [],
       groups: new Map(), votes: new WeakMap(), sampled: new WeakSet(), view: [], finished: false,
       mutations: Core.mutationBuffer(maxPendingChanges), contrastCandidates: new Set(), contrastDirty: new Set(), nativeInk: new WeakMap(),
       cacheGeneration: read(clearKey, null), hostGeneration: read(hostClearKey, null),
@@ -4869,6 +5191,7 @@ function start() {
   }
 
   function clearSite() {
+    if (phasedStorage) return clearExtensionCache('clear-site');
     write(hostClearKey, `${Date.now()}-${Math.random()}`);
     const index = cacheIndex();
     for (const key of [legacyProfileKey, ...MODES.map(profileKeyFor)]) {
@@ -4880,12 +5203,23 @@ function start() {
   }
 
   function clearAll() {
+    if (phasedStorage) return clearExtensionCache('clear-all');
     write(clearKey, `${Date.now()}-${Math.random()}`);
     for (const key of new Set([legacyProfileKey, ...MODES.map(profileKeyFor), ...profileKeys(), ...Object.keys(cacheIndex())])) {
       if (key.startsWith('ec:profile:')) remove(key);
     }
     write(indexKey, {});
     onCacheCleared();
+  }
+
+  async function clearExtensionCache(type) {
+    const cleared = await gmCacheOperation({ type });
+    if (!stopped) {
+      cacheClearError = cleared ? '' : '未能清理缓存；请重试。';
+      if (cleared) onCacheCleared();
+      else panel?.update();
+    }
+    return cleared;
   }
 
   function onCacheCleared() {
@@ -4896,20 +5230,36 @@ function start() {
   }
 
   function preferenceSnapshot() {
-    return { settings, site, apiKey, sitePreferences };
+    return { settings, site, apiKey, sitePreferences, ...(phasedStorage ? {
+      keyReady: gmKeyState(secretKey) === 'ready', keyRevision: gmApiKeyRevision(),
+    } : {}) };
+  }
+
+  function connectionChangedSince(before) {
+    const connectionFields = ['baseURL', 'model', 'apiType', 'reasoningEffort', 'serviceTier'];
+    const keyChanged = before.apiKey !== apiKey && (!phasedStorage || before.keyReady || before.keyRevision !== gmApiKeyRevision());
+    return keyChanged || connectionFields.some(field => before.settings[field] !== settings[field]);
+  }
+
+  function shouldForceAfterSettings(before) {
+    return settings.aiPolicy !== 'never' &&
+      (connectionChangedSince(before) || (settings.aiPolicy === 'always' && before.settings.aiPolicy !== 'always'));
   }
 
   function applySettingsChanges(before) {
-    const connectionFields = ['baseURL', 'model', 'apiType', 'reasoningEffort', 'serviceTier'];
-    const connectionChanged = before.apiKey !== apiKey || connectionFields.some(field => before.settings[field] !== settings[field]);
+    if (suspended || visibilityPaused()) {
+      if (!siteEnabled() && (paintedMode || status !== 'off')) clearDisabledSite();
+      panel?.update();
+      return;
+    }
+    const connectionChanged = connectionChangedSince(before);
     const zoomChanged = before.sitePreferences.fontScale !== sitePreferences.fontScale;
     if (before.settings.restEnabled !== settings.restEnabled || before.settings.restInterval !== settings.restInterval) syncRest();
     if (zoomChanged) applyZoom();
     if (before.site !== site || connectionChanged || before.settings.enabled !== settings.enabled ||
       before.settings.aiPolicy !== settings.aiPolicy) {
       lastError = '';
-      restart({ force: settings.aiPolicy !== 'never' &&
-        (connectionChanged || (settings.aiPolicy === 'always' && before.settings.aiPolicy !== 'always')) });
+      restart({ force: shouldForceAfterSettings(before) });
     } else if (zoomChanged || before.settings.palette !== settings.palette || before.settings.textDepth !== settings.textDepth ||
       before.sitePreferences.textDepth !== sitePreferences.textDepth) {
       refreshContrast();
@@ -4918,6 +5268,7 @@ function start() {
   }
 
   function setSettings({ settings: value, apiKey: key, site: override, siteDepth }) {
+    if (!storageWritable()) throw new Error('未能读取扩展存储；请刷新后再保存设置。');
     const before = preferenceSnapshot();
     const next = normalizeSettings(value);
     const changedKey = typeof key === 'string' && key !== apiKey;
@@ -4950,7 +5301,8 @@ function start() {
     if (!acceptTheme(theme)) return;
     const switched = theme.mode !== selectedMode;
     const waiting = run && !run.mode ? run : null;
-    if (switched || waiting) restart({ force: waiting?.force, manual: waiting?.manual, retainPaint: !switched, theme });
+    if (switched || waiting) restart({ force: waiting?.force, manual: waiting?.manual,
+      catchUp: waiting?.catchUp, retainPaint: !switched, theme });
   }
 
   function scheduleThemeCheck() {
@@ -4962,8 +5314,8 @@ function start() {
     }, 32);
   }
 
-  function attachThemeBody() {
-    if (!themeObserver || observedBody === document.body) return false;
+  function attachThemeBody(force = false) {
+    if (!themeObserver || suspended || (!force && observedBody === document.body)) return false;
     observedBody = document.body;
     themeObserver.disconnect();
     themeObserver.observe(root, { attributes: true, childList: true });
@@ -4974,10 +5326,10 @@ function start() {
   function activateRoot() {
     root = document.documentElement;
     if (!root || stopped) return;
-    applyZoom();
     rootObserver?.disconnect();
-    let competing = conflict();
+    competing = conflict();
     themeObserver = new MutationObserver(records => {
+      if (suspended || visibilityPaused()) return;
       if (competing !== conflict()) {
         competing = conflict();
         restart();
@@ -4990,26 +5342,95 @@ function start() {
         scheduleThemeCheck();
       }
     });
-    attachThemeBody();
-    restart();
+    if (!suspended) {
+      applyZoom();
+      attachThemeBody(true);
+      restart();
+    }
   }
 
-  function suspendPage(event) {
-    suspended = true;
+  function pauseWork() {
     clearTimeout(resumeTimer);
+    resumeTimer = null;
+    if (suspended) return;
+    suspended = true;
+    suspendedPreferences = preferenceSnapshot();
     clearTimeout(themeCheckTimer);
     themeCheckTimer = null;
     resetThemeCandidate();
-    activeLease?.();
-    cancelRun();
-    // A site can cancel beforeunload. Resume if no pagehide follows.
-    if (event.type === 'beforeunload') resumeTimer = setTimeout(resumePage, 1000);
+    themeObserver?.disconnect();
+    stopCachedContrast();
+    cancelRun('page-suspended');
+    stopScaleHint();
+    panel?.setPaused(true);
+    syncRest();
+    setStatus(status === 'ai-pending' ? 'off' : status);
   }
 
-  function resumePage() {
-    if (!suspended || stopped) return;
-    suspended = false;
-    restart();
+  function clearUnloadHold() {
+    clearTimeout(unloadTimer);
+    unloadTimer = null;
+    unloading = false;
+  }
+
+  function reconcilePage() {
+    if (stopped) return;
+    if (pageHidden || visibilityPaused()) clearUnloadHold();
+    if (pageHidden || unloading || visibilityPaused()) {
+      pauseWork();
+      return;
+    }
+    if (!suspended || resumeTimer != null) return;
+    // Browsers may deliver visibilitychange and pageshow in either order.
+    // Keep work paused until the coalesced turn, and recheck all three holds.
+    resumeTimer = setTimeout(() => {
+      resumeTimer = null;
+      if (stopped || pageHidden || unloading || visibilityPaused()) return;
+      const before = suspendedPreferences ?? preferenceSnapshot();
+      suspendedPreferences = null;
+      loadSettings();
+      const force = shouldForceAfterSettings(before);
+      suspended = false;
+      competing = conflict();
+      panel?.setPaused(false);
+      applyZoom();
+      attachThemeBody(true);
+      restart({ force, catchUp: mobileExtension() });
+      syncRest();
+      siteHealthChanged();
+    }, 0);
+  }
+
+  function onPageHide() {
+    pageHidden = true;
+    reconcilePage();
+  }
+
+  function onPageShow() {
+    pageHidden = false;
+    clearUnloadHold();
+    reconcilePage();
+  }
+
+  function onBeforeUnload() {
+    if (stopped || unloading) return;
+    if (pageHidden || visibilityPaused()) { reconcilePage(); return; }
+    unloading = true;
+    reconcilePage();
+    // A site can cancel beforeunload. Resume only if still visible and no
+    // definitive pagehide followed; neither event is guaranteed on mobile.
+    unloadTimer = setTimeout(() => {
+      clearUnloadHold();
+      reconcilePage();
+    }, 1000);
+  }
+
+  function onTouchLayout() {
+    reconcilePage();
+    if (run?.finished) {
+      if (mobileExtension()) stopShadowProbe(run);
+      else probeShadows(run);
+    }
   }
 
   function onRouteChange() {
@@ -5021,23 +5442,27 @@ function start() {
   const pageHistory = safe(() => (typeof unsafeWindow === 'undefined' ? window : unsafeWindow).history, window.history);
   const unwatchHistory = Core.watchHistory(pageHistory, onRouteChange);
   // In an isolated userscript world, History wrappers may not see page-script calls.
-  window.navigation?.addEventListener('currententrychange', onRouteChange);
+  window.navigation?.addEventListener?.('currententrychange', onRouteChange);
   window.addEventListener('popstate', onRouteChange);
-  darkPreference?.addEventListener('change', scheduleThemeCheck);
-  window.addEventListener('pagehide', suspendPage);
-  window.addEventListener('beforeunload', suspendPage);
-  window.addEventListener('pageshow', resumePage);
+  darkPreference?.addEventListener?.('change', scheduleThemeCheck);
+  touchLayout?.addEventListener?.('change', onTouchLayout);
+  if (packaged) document.addEventListener('visibilitychange', reconcilePage);
+  window.addEventListener('pagehide', onPageHide);
+  window.addEventListener('beforeunload', onBeforeUnload);
+  window.addEventListener('pageshow', onPageShow);
 
   if (root) activateRoot();
   else {
     rootObserver = new MutationObserver(activateRoot);
     rootObserver.observe(document, { childList: true });
   }
+  if (suspended) suspendedPreferences = preferenceSnapshot();
   panel = Panel.init({
     getState: () => ({ settings: { ...settings }, apiKeySuffix: apiKey.slice(-4), site,
+      keyStatus: phasedStorage ? gmKeyState(secretKey) : undefined,
       sitePreferences, health: currentHealth(), healthScaleSource, hasScaleSuggestion: hasScaleSuggestion(),
       restPalette: paintedMode ? Core.paletteForDepth(paintedPalette, paintedMode, paintedDepth) : null,
-      enabled: enabled(), pending, status, lastError, conflict: conflict(), ...cacheStats() }),
+      enabled: siteEnabled(), suspended, pending, status, lastError, conflict: conflict(), ...cacheStats() }),
     setSettings,
     applyScale,
     adjustScale: change => applyScale(adjustFontScale(sitePreferences.fontScale, change)),
@@ -5048,19 +5473,39 @@ function start() {
     markScaleHintShown() { updateSitePreferences({ lastScaleHintDate: localDay(Date.now()) }); },
     onHintOpportunity: scheduleScaleHint,
     diagnostics,
+    diagnosticsStatus: phasedStorage ? () => gmKeyState(diagnosticsKey) : undefined,
+    loadDiagnostics: phasedStorage ? async () => {
+      const ready = await gmLoadKey(diagnosticsKey);
+      if (!stopped) panel?.update();
+      return ready;
+    } : undefined,
+    loadApiKey: phasedStorage ? loadApiKey : undefined,
+    loadCacheStats: phasedStorage ? async () => {
+      await gmLoadKey(indexKey);
+      if (!stopped) panel?.update();
+    } : undefined,
     clearDiagnostics() {
+      if (!storageWritable()) return false;
+      if (phasedStorage) return (async () => {
+        if (!await gmLoadKey(diagnosticsKey) || stopped || suspended || visibilityPaused()) return false;
+        remove(diagnosticsKey);
+        const saved = await gmWriteSucceeded(diagnosticsKey);
+        if (!stopped) panel?.update();
+        return saved;
+      })();
       remove(diagnosticsKey);
       panel?.update();
     },
     toggleSite() {
       if (conflict()) return;
-      site = enabled() ? 'off' : 'on';
+      site = siteEnabled() ? 'off' : 'on';
       write(siteKey, site, true);
       lastError = '';
       restart();
     },
-    refreshSite() {
+    async refreshSite() {
       if (!enabled()) return;
+      if (phasedStorage && (!await loadApiKey() || !enabled())) return;
       if (!apiKey) {
         lastError = '请先在设置中填写 API 密钥。';
         panel?.update();
@@ -5071,11 +5516,16 @@ function start() {
     },
     clearSite,
     clearAll,
-    async testConnection({ settings: value, apiKey: key }) {
+    async testConnection({ settings: value, apiKey: key }, signal) {
+      if (suspended || visibilityPaused()) throw new Error(REQUEST_ERRORS.cancelled);
+      if (!storageWritable()) throw new Error('未能读取扩展存储；请刷新后重试。');
+      if (phasedStorage && key === undefined && !await loadApiKey()) throw new Error('未能读取 API 密钥。');
+      if (signal?.aborted || suspended || visibilityPaused()) throw new Error(REQUEST_ERRORS.cancelled);
       const config = configuration(normalizeSettings(value), key === undefined ? apiKey : key, true);
-      return connectionPing(config);
+      return connectionPing(config, signal);
     },
   });
+  if (suspended) panel.setPaused(true);
   syncRest();
   scheduleScaleHint();
   const settingsChanged = () => {
@@ -5112,9 +5562,18 @@ function start() {
     panel?.update();
   });
   listen(indexKey, () => panel?.update());
+  if (phasedStorage) listen(restKey, () => { if (!restCleanup && settings.restEnabled) syncRest(); });
   listen(diagnosticsKey, () => panel?.update());
   for (const key of [clearKey, hostClearKey]) listen(key, () => { if (run && !run.finished) onCacheCleared(); });
   window.addEventListener('storage', onStorage);
+  if (phasedStorage && !suspended && !mobileExtension() && document.visibilityState !== 'hidden') {
+    // Leave at least one render opportunity before copying unrelated profiles.
+    // Mobile starts bulk work on demand (cache writes, legacy migration, or UI).
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (stopped || suspended || document.visibilityState === 'hidden') return;
+      migrateWhenReady();
+    }));
+  }
   function onStorage(event) {
     if (event.key === settingsKey || event.key === siteKey || event.key === sitePrefsKey) {
       memory.delete(event.key);
@@ -5126,6 +5585,7 @@ function start() {
     if (stopped) return;
     stopped = true;
     clearTimeout(resumeTimer);
+    clearUnloadHold();
     clearTimeout(themeCheckTimer);
     resetThemeCandidate();
     restCleanup?.();
@@ -5134,12 +5594,14 @@ function start() {
     cancelRun();
     rootObserver?.disconnect();
     themeObserver?.disconnect();
-    darkPreference?.removeEventListener('change', scheduleThemeCheck);
-    window.removeEventListener('pagehide', suspendPage);
-    window.removeEventListener('beforeunload', suspendPage);
-    window.removeEventListener('pageshow', resumePage);
+    darkPreference?.removeEventListener?.('change', scheduleThemeCheck);
+    touchLayout?.removeEventListener?.('change', onTouchLayout);
+    if (packaged) document.removeEventListener('visibilitychange', reconcilePage);
+    window.removeEventListener('pagehide', onPageHide);
+    window.removeEventListener('beforeunload', onBeforeUnload);
+    window.removeEventListener('pageshow', onPageShow);
     window.removeEventListener('popstate', onRouteChange);
-    window.navigation?.removeEventListener('currententrychange', onRouteChange);
+    window.navigation?.removeEventListener?.('currententrychange', onRouteChange);
     unwatchHistory();
     for (const unsubscribe of listeners) unsubscribe();
     window.removeEventListener('storage', onStorage);
